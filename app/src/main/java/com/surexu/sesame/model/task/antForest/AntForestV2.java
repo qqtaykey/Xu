@@ -415,7 +415,10 @@ public class AntForestV2 extends ModelTask implements EnergyCollectCallback {
         super.boot(classLoader);
         FixedOrRangeIntervalLimit queryIntervalLimit = new FixedOrRangeIntervalLimit(queryInterval.getValue(), 10, 10000);
         RpcIntervalLimit.addIntervalLimit("alipay.antforest.forest.h5.queryHomePage", queryIntervalLimit);
-        RpcIntervalLimit.addIntervalLimit("alipay.antforest.forest.h5.queryFriendHomePage", queryIntervalLimit);
+        // 首页与好友家各持一个实例：限流时间戳存在实例里（见 RpcIntervalLimit.enterIntervalLimit），
+        // 共用同一实例会让两个接口互相刷新时间戳、串行等待，收取整体变慢。
+        RpcIntervalLimit.addIntervalLimit("alipay.antforest.forest.h5.queryFriendHomePage",
+                new FixedOrRangeIntervalLimit(queryInterval.getValue(), 10, 10000));
         RpcIntervalLimit.addIntervalLimit("alipay.antmember.forest.h5.collectEnergy", 0);
         RpcIntervalLimit.addIntervalLimit("alipay.antmember.forest.h5.queryEnergyRanking", 100);
         RpcIntervalLimit.addIntervalLimit("alipay.antforest.forest.h5.fillUserRobFlag", 500);
@@ -506,7 +509,12 @@ public class AntForestV2 extends ModelTask implements EnergyCollectCallback {
                 do {
                     if (hasMore) {
                         hasMore = false;
-                        selfHomeObject = querySelfHome();
+                        // 重拉主页失败(限流/网络异常)时 querySelfHome 返回 null，直接赋值会让后续 selfHomeObject 解引用抛 NPE；
+                        // 这里失败即保留上一份有效数据，行为等价于"本轮不再翻页"
+                        JSONObject refreshedHomeObject = querySelfHome();
+                        if (refreshedHomeObject != null) {
+                            selfHomeObject = refreshedHomeObject;
+                        }
                     }
                     if (collectWateringBubble.getValue()) {
                         JSONArray wateringBubbles = selfHomeObject.has("wateringBubbles") ? selfHomeObject.getJSONArray("wateringBubbles") : new JSONArray();
@@ -1079,6 +1087,8 @@ public class AntForestV2 extends ModelTask implements EnergyCollectCallback {
             }
         } catch (Throwable t) {
             Log.printStackTrace(t);
+            // 失败响应体(缺少 now 等业务字段)会让对象成为"半成品"：置空，避免调用方判空通过后按正常主页解析
+            userHomeObject = null;
         }
         return userHomeObject;
     }
@@ -1096,6 +1106,8 @@ public class AntForestV2 extends ModelTask implements EnergyCollectCallback {
             Log.debug("服务器时间：" + serverTime + "，本地与服务器时间差：" + offsetTime);
         } catch (Throwable t) {
             Log.printStackTrace(t);
+            // 同上：好友主页失败响应置空，调用方(queryFriendHome 4 处)均已判空
+            userHomeObject = null;
         }
         return userHomeObject;
     }
@@ -2449,27 +2461,31 @@ public class AntForestV2 extends ModelTask implements EnergyCollectCallback {
         }
     }
 
+    /**
+     * 森林任务列表复核轮次上限：每轮都会重拉一次任务列表，服务端状态不推进时必须靠上限收敛
+     * （领奖是幂等的，任务持续 FINISHED 时会一直返回成功，没有上限就会一直重拉）。
+     * <p>与乐园限定任务（optionalPlayRoundLimit）、新版保护地（固定 20 轮）保持同一收敛约定。
+     */
+    private static final int TASK_LIST_MAX_ROUNDS = 20;
+
     private void queryTaskList() {
         queryTaskList("DNHZ_SL_college", "DAXUESHENG_SJK");
         queryTaskList("DXS_BHZ", "NENGLIANGZHAO_20230807");
         queryTaskList("DXS_JSQ", "JIASUQI_20230808");
         try {
-            boolean doubleCheck = true;
-            while (doubleCheck) {
+            for (int round = 0; round < TASK_LIST_MAX_ROUNDS; round++) {
+                boolean doubleCheck = false;
                 JSONObject jo = new JSONObject(AntForestRpcCall.queryTaskList());
                 if (!MessageUtil.checkResultCode(TAG, jo)) {
-                    doubleCheck = false;
-                    continue;
+                    break;
                 }
                 // 添加安全的空值判断
                 if (!jo.has("forestTasksNew")) {
-                    doubleCheck = false;
-                    continue;
+                    break;
                 }
                 JSONArray forestTasksNew = jo.optJSONArray("forestTasksNew");
                 if (forestTasksNew == null || forestTasksNew.length() == 0) {
-                    doubleCheck = false;
-                    continue;
+                    break;
                 }
                 for (int i = 0; i < forestTasksNew.length(); i++) {
                     JSONObject forestTask = forestTasksNew.optJSONObject(i);
@@ -2480,11 +2496,17 @@ public class AntForestV2 extends ModelTask implements EnergyCollectCallback {
                     if (taskInfoList == null) {
                         continue;
                     }
-                    doubleCheck = doForsetTaskList(taskInfoList);
+                    // 累积而非覆盖：多个任务组里只要有一组真推进了，就值得再拉一轮复核
+                    if (doForsetTaskList(taskInfoList)) {
+                        doubleCheck = true;
+                    }
+                }
+                // 本轮没有任何推进：收敛收工
+                if (!doubleCheck) {
+                    break;
                 }
             }
-            doubleCheck = true;
-            while (doubleCheck) {
+            for (int round = 0; round < TASK_LIST_MAX_ROUNDS; round++) {
                 JSONObject jo = new JSONObject(AntForestRpcCall.listTaskopengreen());
                 if (!MessageUtil.checkResultCode(TAG, jo)) {
                     return;
@@ -2497,7 +2519,9 @@ public class AntForestV2 extends ModelTask implements EnergyCollectCallback {
                 if (taskInfoList == null || taskInfoList.length() == 0) {
                     return;
                 }
-                doubleCheck = doForsetTaskList(taskInfoList);
+                if (!doForsetTaskList(taskInfoList)) {
+                    break;
+                }
             }
         } catch (Throwable t) {
             Log.err(TAG, "queryTaskList err:", t);
@@ -2568,7 +2592,9 @@ public class AntForestV2 extends ModelTask implements EnergyCollectCallback {
                             () -> attemptFinishTask(sceneCode, taskType, taskTitle), Log::forest,
                             new TaskAttemptPolicy.Site("AntForestVitalityTaskList", "森林任务", taskType, sceneCode,
                                     (TaskAttemptPolicy.StatusProbe) (k) -> probeForestVitalityStatus(sceneCode, taskType)));
-                    doubleCheck = outcome == Outcome.DONE || outcome == Outcome.TRIGGERED;
+                    if (outcome == Outcome.DONE || outcome == Outcome.TRIGGERED) {
+                        doubleCheck = true;
+                    }
                 }
             }
             //可能是触发限时挑战奖励的

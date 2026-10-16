@@ -65,7 +65,7 @@ public class TaskAttemptPolicy {
 
     /** 列表复核的轮询间隔与轮数：服务端异步落定的任务（如森林「消耗活力值得机会」）要十几秒才变完成 */
     private static final long PROBE_INTERVAL_MS = 3000L;
-    private static final int PROBE_ROUNDS = 6;
+    private static final int PROBE_ROUNDS = 10;
 
     /** 处理结论 */
     public enum Outcome {
@@ -514,11 +514,15 @@ public class TaskAttemptPolicy {
      */
     private static ProbeResult probeWithPolling(StatusProbe probe, String key) {
         ProbeResult pr = null;
+        // 先探再等：服务端常常在响应回来的同时就已落定，首轮白等一个间隔纯属浪费；
+        // 只有没落定才需要留出落态时间（轮数上限见 PROBE_ROUNDS）
         for (int round = 1; round <= PROBE_ROUNDS; round++) {
-            TimeUtil.sleep(PROBE_INTERVAL_MS);
             pr = probe.probe(key);
             if (isDone(pr)) {
                 return pr;
+            }
+            if (round < PROBE_ROUNDS) {
+                TimeUtil.sleep(PROBE_INTERVAL_MS);
             }
         }
         return pr;

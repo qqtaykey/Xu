@@ -19,12 +19,16 @@ import com.surexu.sesame.data.modelFieldExt.StringModelField;
 import com.surexu.sesame.util.Log;
 import com.surexu.sesame.util.StringUtil;
 import com.surexu.sesame.util.ToastUtil;
+import com.surexu.sesame.util.idMap.UserIdMap;
 
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
+
+import org.json.JSONArray;
+import org.json.JSONObject;
 
 public class AnswerAI extends Model {
 
@@ -37,6 +41,23 @@ public class AnswerAI extends Model {
     private static final String AI_TEST_PROMPT = "这是一次接口连通性测试。请只回复 OK。";
     /** 自检结果回显到 Toast 的最大长度 */
     private static final int AI_TEST_RESULT_MAX_LENGTH = 120;
+
+    /** AI 指令解析提示词前缀：把功能清单连同当前开关状态一起交给模型，模型既能下指令、也能回答"XX开了吗" */
+    private static final String AI_COMMAND_PROMPT_PREFIX =
+            "你是支付宝芝麻粒自动化模块的语音控制助手。请判断用户这句话是在查询或修改功能开关，"
+                    + "只输出一个 JSON 对象，不要输出解释、不要用 markdown 代码块。\n"
+                    + "可用功能清单（模型名[总开关:开/关]，其后为子功能名:开/关）：\n";
+    /** AI 指令解析提示词后缀：约束输出格式与边界，防止模型编造功能名或擅自批量操作 */
+    private static final String AI_COMMAND_PROMPT_SUFFIX =
+            "\n输出格式：{\"handled\":true,\"reply\":\"给用户看的简短中文回复\","
+                    + "\"actions\":[{\"model\":\"模型名\",\"field\":\"子功能名，空字符串表示模型总开关\",\"enable\":true}]}\n"
+                    + "规则：\n"
+                    + "1. 模型名、子功能名只能取清单里出现过的，不得编造；\n"
+                    + "2. 只是查询状态、没有开关动作时 handled=true 且 actions 为空数组，reply 按清单里的状态直接回答；\n"
+                    + "3. 与功能开关完全无关的问题 handled=false，reply 留空；\n"
+                    + "4. 用户只说\"全部\"\"所有功能\"但没指明是哪个模块时不要擅自操作，handled=true、actions 为空，reply 请用户补充范围；\n"
+                    + "5. reply 要简短，说清改了哪些开关、或当前是什么状态。\n"
+                    + "用户的话：";
 
     /** 日志里题目与选项列表的最大字数：整题与全部选项都写进日志会显著撑大日志 */
     private static final int LOG_TITLE_MAX_LENGTH = 60;
@@ -165,10 +186,24 @@ public class AnswerAI extends Model {
 
     /**
      * 聊天页控制类指令入口：把自然语言（如"开启森林收能量"）映射为功能开关并落盘生效。
+     * 两级通道：先走规则快通道（零延迟、不耗 token），规则认不出来再交给大模型兜底解析。
+     * 注意：AI 兜底会发网络请求（最长约 30 秒），调用方必须在子线程调用本方法。
      *
-     * @return 已执行的操作描述；未识别为控制指令返回 null（调用方应转走 AI 对话）
+     * @return 已执行的操作描述或 AI 的回复；未识别为控制指令返回 null（调用方转走 AI 对话）
      */
     public static String executeCommand(String question) {
+        String byRule = executeCommandByRule(question);
+        if (byRule != null) {
+            return byRule;
+        }
+        // 规则快通道没认出来时交给大模型：口语化说法、一句话多个动作、状态查询都能处理
+        return executeCommandByAI(question);
+    }
+
+    /**
+     * 规则快通道：把标准句式（如"开启森林收能量""把健康岛全部关闭"）映射为功能开关并落盘。命中返回操作描述，未识别返回 null。
+     */
+    private static String executeCommandByRule(String question) {
         try {
             if (question == null) {
                 return null;
@@ -179,7 +214,12 @@ public class AnswerAI extends Model {
             }
             String q = question.replaceAll("[\\s，。,.！!？?、；;：:\"'']", "").toLowerCase(Locale.ROOT);
             boolean enable;
-            if (containsAny(q, "开启", "打开", "启用", "开一下", "帮我开")) {
+            // 否定句式（"别关收能量""不要打开森林"）语义与动作词相反，必须先判，否则会被"关闭/打开"抢先匹配成反方向
+            if (containsAny(q, "不要关", "别关", "不用关", "不要关闭", "别关闭")) {
+                enable = true;
+            } else if (containsAny(q, "不要开", "别开", "不用开", "不要打开", "别打开")) {
+                enable = false;
+            } else if (containsAny(q, "开启", "打开", "启用", "开一下", "帮我开")) {
                 enable = true;
             } else if (containsAny(q, "关闭", "停用", "禁用", "关一下", "帮我关")) {
                 enable = false;
@@ -215,17 +255,30 @@ public class AnswerAI extends Model {
                         .replace("开一下", "").replace("帮我开", "")
                         .replace("关闭", "").replace("停用", "").replace("禁用", "")
                         .replace("关一下", "").replace("帮我关", "");
+                // 字段引用必须取 ConfigV2 缓存的权威对象：load() 时已把用户配置写入这批对象，
+                // save() 的 collectChangedFields() 也按这批对象比对。不能走 model.getFields()——
+                // AntFarm/AntForestV2 等实现每次调用都 new 字段对象并覆盖实例字段，既让任务运行期
+                // 读到默认值，又使这里的 setObjectValue 落在孤儿对象上、保存时收集不到改动。
+                ModelFields fields = ConfigV2.INSTANCE.getModelFieldsMap().get(model.getClass().getSimpleName());
+                if (fields == null) {
+                    continue;
+                }
                 List<String> fieldHits = new ArrayList<>();
-                if (rest.length() >= 2) {
-                    ModelFields fields = model.getFields();
-                    if (fields != null) {
-                        for (Map.Entry<String, ModelField<?>> entry : fields.entrySet()) {
-                            ModelField<?> field = entry.getValue();
-                            if (!(field instanceof BooleanModelField) || StringUtil.isEmpty(field.getName())) {
-                                continue;
-                            }
-                            // 字段名可能含" | "分隔（分组 | 功能），任一部分与剩余文本互为连续子串即命中
-                            boolean fieldHit = false;
+                List<String> fieldHitNames = new ArrayList<>();
+                // "把森林全部关闭""健康岛所有功能打开"：指定了模型又说了全部/所有，视为该模型下所有子功能。
+                // 只认"全部/所有/全都"这类明确词，不用"都"这种口语泛词，避免"把庄园和森林都关了"这种整片误伤。
+                boolean allFields = containsAny(q, "全部", "所有", "全都");
+                if (rest.length() >= 2 || allFields) {
+                    for (Map.Entry<String, ModelField<?>> entry : fields.entrySet()) {
+                        ModelField<?> field = entry.getValue();
+                        // ModelFields 以字段 code 为键；enable 为模型总开关，单独处理，避免被当子功能重复命中
+                        if (!(field instanceof BooleanModelField) || StringUtil.isEmpty(field.getCode())
+                                || "enable".equals(field.getCode()) || StringUtil.isEmpty(field.getName())) {
+                            continue;
+                        }
+                        // 字段名可能含" | "分隔（分组 | 功能），任一部分与剩余文本互为连续子串即命中
+                        boolean fieldHit = allFields;
+                        if (!fieldHit) {
                             for (String part : field.getName().split("\\|")) {
                                 String p = part.replaceAll("[\\s（）()]", "");
                                 if (p.length() >= 2 && (p.contains(rest) || rest.contains(p))) {
@@ -233,9 +286,10 @@ public class AnswerAI extends Model {
                                     break;
                                 }
                             }
-                            if (fieldHit) {
-                                fieldHits.add(field.getName());
-                            }
+                        }
+                        if (fieldHit) {
+                            fieldHits.add(field.getCode());
+                            fieldHitNames.add(field.getName());
                         }
                     }
                 }
@@ -247,13 +301,16 @@ public class AnswerAI extends Model {
                         changed = true;
                     }
                     changedItems.add(modelName);
-                    for (String fieldName : fieldHits) {
-                        BooleanModelField boolField = (BooleanModelField) model.getFields().get(fieldName);
-                        if (Boolean.TRUE.equals(boolField.getValue()) != enable) {
-                            boolField.setObjectValue(enable);
-                            changed = true;
+                    for (int i = 0; i < fieldHits.size(); i++) {
+                        ModelField<?> hitField = fields.get(fieldHits.get(i));
+                        if (hitField instanceof BooleanModelField) {
+                            BooleanModelField boolField = (BooleanModelField) hitField;
+                            if (Boolean.TRUE.equals(boolField.getValue()) != enable) {
+                                boolField.setObjectValue(enable);
+                                changed = true;
+                            }
                         }
-                        changedItems.add(modelName + "·" + fieldName);
+                        changedItems.add(modelName + "·" + fieldHitNames.get(i));
                     }
                 }
             }
@@ -261,19 +318,193 @@ public class AnswerAI extends Model {
                 return null;
             }
             if (changed) {
-                ConfigV2.save(null, false);
-                try {
-                    Context context = ViewAppInfo.getContext();
-                    if (context != null) {
-                        context.sendBroadcast(new Intent("com.eg.android.AlipayGphone.sesame.restart"));
-                    }
-                } catch (Throwable ignored) {
-                }
+                // 必须落盘到「当前登录账号」的配置文件：原来传 null 会写默认配置(默认.json)，
+                // 当前账号的配置没被更新，重启/切换后语音开关的改动就丢了
+                ConfigV2.save(UserIdMap.getCurrentUid(), false);
+                restartSesame();
             }
             return (enable ? "已开启：" : "已关闭：") + String.join("、", changedItems);
         } catch (Throwable t) {
             Log.printStackTrace(TAG, t);
             return null;
+        }
+    }
+
+    /**
+     * 大模型兜底解析：把整句话连同功能清单交给 AI，要求回结构化 JSON，再由本地校验后执行。
+     * AI 未配置、请求失败或判定为无关指令时返回 null（调用方转走普通 AI 对话）。
+     */
+    private static String executeCommandByAI(String question) {
+        try {
+            if (question == null || question.trim().isEmpty()) {
+                return null;
+            }
+            // AI 兜底同样受"AI答"总开关约束：用户关掉 AI 后就不再走网络解析
+            if (!Boolean.TRUE.equals(enable)) {
+                return null;
+            }
+            CustomAI ai = customAI != null ? customAI : buildCustomAI();
+            if (ai == null) {
+                return null;
+            }
+            String catalog = buildCommandCatalog();
+            if (catalog.isEmpty()) {
+                return null;
+            }
+            String result = ai.getAnswerStr(AI_COMMAND_PROMPT_PREFIX + catalog + AI_COMMAND_PROMPT_SUFFIX + question);
+            if (result == null || result.trim().isEmpty()) {
+                return null;
+            }
+            JSONObject jo = parseJsonObject(result);
+            if (jo == null) {
+                Log.record("AI指令🧠返回内容不是JSON，转普通对话");
+                return null;
+            }
+            if (!jo.optBoolean("handled", false)) {
+                return null;
+            }
+            List<String> changedItems = new ArrayList<>();
+            JSONArray actions = jo.optJSONArray("actions");
+            for (int i = 0; actions != null && i < actions.length(); i++) {
+                JSONObject action = actions.optJSONObject(i);
+                if (action != null) {
+                    applyAction(action.optString("model", ""), action.optString("field", ""),
+                            action.optBoolean("enable", true), changedItems);
+                }
+            }
+            if (!changedItems.isEmpty()) {
+                ConfigV2.save(UserIdMap.getCurrentUid(), false);
+                restartSesame();
+            }
+            String reply = jo.optString("reply", "").trim();
+            if (!reply.isEmpty()) {
+                Log.record("AI指令🧠" + trimForLog(reply, LOG_OPTIONS_MAX_LENGTH));
+                return reply;
+            }
+            return changedItems.isEmpty() ? null : "已设置：" + String.join("、", changedItems);
+        } catch (Throwable t) {
+            Log.printStackTrace(TAG, t);
+            return null;
+        }
+    }
+
+    /**
+     * 执行 AI 下发的单个动作：模型名/字段名必须能在本地配置里找到，找不到就忽略，防止模型编造导致误改配置。
+     * field 为空串表示操作该模型的总开关。
+     */
+    private static void applyAction(String modelName, String fieldName, boolean enable, List<String> changedItems) {
+        if (StringUtil.isEmpty(modelName)) {
+            return;
+        }
+        for (Model model : Model.getModelList()) {
+            if (model == null || model instanceof AnswerAI || StringUtil.isEmpty(model.getName())) {
+                continue;
+            }
+            String name = model.getName();
+            if (!name.equals(modelName) && !name.contains(modelName) && !modelName.contains(name)) {
+                continue;
+            }
+            if (StringUtil.isEmpty(fieldName)) {
+                BooleanModelField enableField = model.getEnableField();
+                if (enableField != null && Boolean.TRUE.equals(enableField.getValue()) != enable) {
+                    enableField.setObjectValue(enable);
+                }
+                changedItems.add(name);
+                return;
+            }
+            ModelFields fields = ConfigV2.INSTANCE.getModelFieldsMap().get(model.getClass().getSimpleName());
+            if (fields == null) {
+                return;
+            }
+            for (Map.Entry<String, ModelField<?>> entry : fields.entrySet()) {
+                ModelField<?> field = entry.getValue();
+                // 与规则通道保持一致：只认布尔子功能，enable 是模型总开关另行处理
+                if (!(field instanceof BooleanModelField) || StringUtil.isEmpty(field.getCode())
+                        || "enable".equals(field.getCode()) || StringUtil.isEmpty(field.getName())) {
+                    continue;
+                }
+                if (!nameMatches(field.getName(), fieldName)) {
+                    continue;
+                }
+                BooleanModelField boolField = (BooleanModelField) field;
+                if (Boolean.TRUE.equals(boolField.getValue()) != enable) {
+                    boolField.setObjectValue(enable);
+                }
+                changedItems.add(name + "·" + field.getName());
+                return;
+            }
+            return;
+        }
+    }
+
+    /** 生成给 AI 的功能清单：模型名[总开关]＋各子功能名与当前状态，只列布尔子功能，尽量紧凑省 token */
+    private static String buildCommandCatalog() {
+        StringBuilder sb = new StringBuilder();
+        for (Model model : Model.getModelList()) {
+            if (model == null || model instanceof AnswerAI || StringUtil.isEmpty(model.getName())) {
+                continue;
+            }
+            ModelFields fields = ConfigV2.INSTANCE.getModelFieldsMap().get(model.getClass().getSimpleName());
+            if (fields == null) {
+                continue;
+            }
+            StringBuilder modelText = new StringBuilder();
+            for (Map.Entry<String, ModelField<?>> entry : fields.entrySet()) {
+                ModelField<?> field = entry.getValue();
+                if (!(field instanceof BooleanModelField) || StringUtil.isEmpty(field.getCode())
+                        || "enable".equals(field.getCode()) || StringUtil.isEmpty(field.getName())) {
+                    continue;
+                }
+                // 字段名可能是"分组 | 功能"，只取最后一段当简称：模型回传的也是这个简称，省 token
+                String[] parts = field.getName().split("\\|");
+                modelText.append('；').append(parts[parts.length - 1].trim())
+                        .append(':').append(stateText((BooleanModelField) field));
+            }
+            // 即使一个子功能都没有也列出模型自身，保证"打开/关闭XX"这类总开关指令也能被识别
+            sb.append(model.getName()).append('[').append(stateText(model.getEnableField())).append(']')
+                    .append(modelText).append('\n');
+        }
+        return sb.toString();
+    }
+
+    /** 开关状态文本：字段缺失（null）时按关处理 */
+    private static String stateText(BooleanModelField field) {
+        return field != null && Boolean.TRUE.equals(field.getValue()) ? "开" : "关";
+    }
+
+    /** 字段名（可能是"分组 | 功能"）与 AI 回传的名字：任一非空片段互相包含即视为同一功能 */
+    private static boolean nameMatches(String fieldName, String target) {
+        for (String part : fieldName.split("\\|")) {
+            String p = part.trim();
+            if (!p.isEmpty() && (p.equals(target) || p.contains(target) || target.contains(p))) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /** 从 AI 回复里截出 JSON 对象：模型常会带前后说明或 ```json 包裹 */
+    private static JSONObject parseJsonObject(String text) {
+        int start = text.indexOf('{');
+        int end = text.lastIndexOf('}');
+        if (start < 0 || end <= start) {
+            return null;
+        }
+        try {
+            return new JSONObject(text.substring(start, end + 1));
+        } catch (Throwable t) {
+            return null;
+        }
+    }
+
+    /** 广播通知宿主重载配置：开关改动要重启芝麻粒任务才生效 */
+    private static void restartSesame() {
+        try {
+            Context context = ViewAppInfo.getContext();
+            if (context != null) {
+                context.sendBroadcast(new Intent("com.eg.android.AlipayGphone.sesame.restart"));
+            }
+        } catch (Throwable ignored) {
         }
     }
 

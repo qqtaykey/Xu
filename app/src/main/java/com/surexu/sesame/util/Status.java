@@ -5,7 +5,6 @@ import com.fasterxml.jackson.databind.JsonMappingException;
 import lombok.Data;
 
 import com.surexu.sesame.data.task.ModelTask;
-import com.surexu.sesame.model.task.antFarm.AntFarm;
 import com.surexu.sesame.model.task.antForest.AntForestV2;
 import com.surexu.sesame.util.idMap.UserIdMap;
 import com.surexu.sesame.data.ConfigV2;
@@ -607,13 +606,13 @@ public class Status {
     }
     
     public static synchronized Boolean canUseSpecialFoodToday() {
-        AntFarm task = ModelTask.getModel(AntFarm.class);
-        if (task == null) {
-            return false;
-        }
         // 特殊食品使用上限(无限:0)，0 表示不限制；字段缺失时视为不可用，避免 NPE。
-        // AntFarm 字段无 Lombok getter，按项目惯例走 ModelFields 读取
-        ModelField<?> limitField = task.getFields().get("useSpecialFoodCountLimit");
+        // 注意：不能走 task.getFields() 读取——AntFarm.getFields() 每次调用都会重建字段对象，
+        // 读到的恒为构造默认值 0（等于无限），用户配置的"使用上限"会完全失效。
+        // 必须走 ConfigV2 缓存的字段（load 时已从磁盘恢复用户配置值），与 Status 中
+        // AntForestV2 字段（wateredFriendList 等）的读取方式保持一致。
+        ModelFields antFarmFields = ConfigV2.INSTANCE.getModelFieldsMap().get("AntFarm");
+        ModelField<?> limitField = antFarmFields == null ? null : antFarmFields.get("useSpecialFoodCountLimit");
         if (limitField == null || limitField.getValue() == null) {
             return false;
         }

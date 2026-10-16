@@ -379,7 +379,14 @@ public class GreenFinance extends ModelTask {
                         Status.greenFinancePointFriend();
                         return;
                     }
-                    n = result.getInt("nextStartIndex");
+                    // 游标不推进说明服务端已无更多页：直接收工。该 while(true) 没有页数上限，
+                    // 一旦 nextStartIndex 停在原值就会一直重拉同一页（1.5 秒一轮，且会持续打接口）。
+                    int nextStartIndex = result.getInt("nextStartIndex");
+                    if (nextStartIndex <= n) {
+                        Log.other("绿色经营🙋，好友金币巡查结束#游标未推进");
+                        break;
+                    }
+                    n = nextStartIndex;
                     JSONArray list = result.getJSONArray("rankingList");
                     for (int i = 0; i < list.length(); i++) {
                         JSONObject object = list.getJSONObject(i);

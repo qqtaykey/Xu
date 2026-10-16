@@ -270,8 +270,13 @@ public class AntFarm extends ModelTask {
                 if ("ORCHARD".equals(ownerAnimal.locationType)) {
                     Log.farm("庄园通知📣[你家的小鸡给拉去除草了！]");
                     JSONObject joRecallAnimal = new JSONObject(AntFarmRpcCall.orchardRecallAnimal(ownerAnimal.animalId, ownerAnimal.currentFarmMasterUserId));
-                    int manureCount = joRecallAnimal.getInt("manureCount");
-                    Log.farm("召回小鸡📣收获[" + manureCount + "g肥料]");
+                    // 响应不可信：失败响应里没有 manureCount，直接 getInt 会抛异常、吞掉本轮后续庄园流程
+                    if (MessageUtil.checkMemo(TAG, joRecallAnimal)) {
+                        Log.farm("召回小鸡📣收获[" + joRecallAnimal.optInt("manureCount", 0) + "g肥料]");
+                    }
+                    // 召回后必须重新同步自家庄园状态：否则 ownerAnimal 仍是"不在家"，
+                    // 本轮后面的投喂、特殊食品、收肥料全被 HOME 判断挡掉
+                    syncAnimalStatus(ownerFarmId);
                 } else {
                     syncAnimalStatusAtOtherFarm(ownerAnimal.currentFarmId);
                     boolean guest = false;
@@ -686,10 +691,17 @@ public class AntFarm extends ModelTask {
     private void autoFeedAnimal() {
         syncAnimalStatus(ownerFarmId);
         if (!AnimalFeedStatus.EATING.name().equals(ownerAnimal.animalFeedStatus)) {
-            // 状态不是吃食中（接口失败仍显示饥饿/睡觉/离家等）：安排短延迟重查，
-            // 避免「喂一次后蹲点链路断裂、要等下一轮模块轮询才恢复」的不自动喂鸡。
+            // 状态不是吃食中（接口失败仍显示饥饿/睡觉/离家等）：饥饿/未知状态安排短延迟重查，
+            // 避免「喂一次后蹲点链路断裂、要等下一轮模块轮询才恢复」的不自动喂鸡；
+            // 睡眠/离家不需要蹲点，直接放弃本轮。
+            if (AnimalFeedStatus.SLEEPY.name().equals(ownerAnimal.animalFeedStatus)
+                    || !AnimalInteractStatus.HOME.name().equals(ownerAnimal.animalInteractStatus)) {
+                return;
+            }
             long retryTime = System.currentTimeMillis() + TimeUnit.SECONDS.toMillis(30);
-            String retryTaskId = "UPDATE|FA|" + ownerFarmId;
+            // 独立 ID：不能用 "UPDATE|FA|<farmId>"（与本任务同名，hasChildTask 恒真，
+            // 且重试任务会被本任务执行完后的 finally removeChildTask 误删，重试永远排不上）
+            String retryTaskId = "UPDATE|FA|" + ownerFarmId + "|RETRY";
             if (!hasChildTask(retryTaskId)) {
                 addChildTask(new ChildModelTask(retryTaskId, "UPDATE", this::autoFeedAnimal, retryTime));
             }
