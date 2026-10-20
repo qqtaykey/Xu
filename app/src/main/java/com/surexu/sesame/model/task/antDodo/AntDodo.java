@@ -36,6 +36,9 @@ import java.util.concurrent.TimeUnit;
 public class AntDodo extends ModelTask {
     private static final String TAG = AntDodo.class.getSimpleName();
 
+    /** 刮卡请求间隔：沿用实测脚本值(≥500ms，防服务端风控) */
+    private static final long SCRATCH_CARD_INTERVAL_MS = 800L;
+
     @Override
     public String getName() {
         return "物种";
@@ -67,6 +70,7 @@ public class AntDodo extends ModelTask {
     private ChoiceModelField giftToFriendMedalGenerationStatusType;
     private ChoiceModelField giftToFriendFantasticLevelType;
     private SelectModelField giftToFriendList;
+    private BooleanModelField scratchCard;
 
     @Override
     public ModelFields getFields() {
@@ -92,6 +96,7 @@ public class AntDodo extends ModelTask {
         modelFields.addField(giftToFriendMedalGenerationStatusType = new ChoiceModelField("giftToFriendMedalGenerationStatusType", "赠送卡片 | 勋章合成状态", MedalGenerationStatusType.ALL, MedalGenerationStatusType.nickNames).setDependsOn("giftToFriend"));
         modelFields.addField(giftToFriendFantasticLevelType = new ChoiceModelField("giftToFriendFantasticLevelType", "赠送卡片 | 最低等级", FantasticLevelType.COMMON, FantasticLevelType.nickNames).setDependsOn("giftToFriend"));
         modelFields.addField(giftToFriendList = new SelectModelField("giftToFriendList", "赠送卡片 | 好友列表", new LinkedHashSet<>(), AlipayUser::getList, "会赠送所有满足条件的卡片给已选择的好友").setDependsOn("giftToFriend"));
+        modelFields.addField(scratchCard = new BooleanModelField("scratchCard", "刮刮卡 | 开启", true));
         return modelFields;
     }
 
@@ -114,6 +119,9 @@ public class AntDodo extends ModelTask {
             }
 
             collect();
+            if (scratchCard.getValue()) {
+                scratchCard();
+            }
             if (dodoTaskList.getValue()) {
                 taskList();
             }
@@ -268,6 +276,91 @@ public class AntDodo extends ModelTask {
             }
         } catch (Throwable t) {
             Log.err(TAG, "collectAnimalCard err:", t);
+        }
+    }
+
+    /**
+     * 刮刮卡：把 homePage 中 scratchable=true 且 scratched=false 的卡片逐张刮开。
+     * 判据只看卡片自身字段——showSpeciesV2 不是刮卡开关（实测为 false 时仍有待刮卡）。
+     * 入参 animalId/bookId 取自 curCollection[].animal，cardInstanceId 取自该条目的 collectDetail.cardList[]。
+     */
+    private void scratchCard() {
+        try {
+            JSONObject jo = new JSONObject(AntDodoRpcCall.homePage());
+            if (!MessageUtil.checkResultCode(TAG, jo)) {
+                return;
+            }
+            JSONObject data = jo.optJSONObject("data");
+            JSONArray curCollection = data != null ? data.optJSONArray("curCollection") : null;
+            if (curCollection == null) {
+                return;
+            }
+            // 先基于同一次 homePage 响应收集待刮清单，再逐张提交，避免边遍历边刮时服务端列表变化导致漏刮
+            JSONArray pendingCards = new JSONArray();
+            for (int i = 0; i < curCollection.length(); i++) {
+                JSONObject collectionItem = curCollection.optJSONObject(i);
+                if (collectionItem == null) {
+                    continue;
+                }
+                JSONObject animal = collectionItem.optJSONObject("animal");
+                JSONObject collectDetail = collectionItem.optJSONObject("collectDetail");
+                JSONArray cardList = collectDetail != null ? collectDetail.optJSONArray("cardList") : null;
+                if (animal == null || cardList == null) {
+                    continue;
+                }
+                String animalId = animal.optString("animalId");
+                String bookId = animal.optString("bookId");
+                if (animalId.isEmpty() || bookId.isEmpty()) {
+                    // 入参不全服务端必拒，跳过该图鉴条目
+                    continue;
+                }
+                String animalName = animal.optString("name", "未知动物");
+                for (int j = 0; j < cardList.length(); j++) {
+                    JSONObject cardInfo = cardList.optJSONObject(j);
+                    if (cardInfo == null) {
+                        continue;
+                    }
+                    if (!cardInfo.optBoolean("scratchable") || cardInfo.optBoolean("scratched")) {
+                        continue;
+                    }
+                    String cardInstanceId = cardInfo.optString("cardInstanceId");
+                    if (cardInstanceId.isEmpty()) {
+                        continue;
+                    }
+                    JSONObject pendingCard = new JSONObject();
+                    pendingCard.put("animalId", animalId);
+                    pendingCard.put("bookId", bookId);
+                    pendingCard.put("cardInstanceId", cardInstanceId);
+                    pendingCard.put("animalName", animalName);
+                    pendingCards.put(pendingCard);
+                }
+            }
+            if (pendingCards.length() == 0) {
+                return;
+            }
+            int scratchCount = 0;
+            int totalEnergyGram = 0;
+            for (int i = 0; i < pendingCards.length(); i++) {
+                JSONObject pendingCard = pendingCards.getJSONObject(i);
+                jo = new JSONObject(AntDodoRpcCall.scratchCard(pendingCard.getString("animalId"),
+                        pendingCard.getString("bookId"), pendingCard.getString("cardInstanceId")));
+                if (MessageUtil.checkResultCode(TAG, jo)) {
+                    JSONObject scratchData = jo.optJSONObject("data");
+                    int energyGram = scratchData != null ? scratchData.optInt("energyGram", 0) : 0;
+                    scratchCount++;
+                    totalEnergyGram += energyGram;
+                    Log.forest("神奇物种🦕刮卡[" + pendingCard.getString("animalName") + "]#能量+" + energyGram + "g");
+                }
+                // 最后一张不必等待
+                if (i < pendingCards.length() - 1) {
+                    TimeUtil.sleep(SCRATCH_CARD_INTERVAL_MS);
+                }
+            }
+            if (scratchCount > 0) {
+                Log.record("神奇物种刮卡完成：刮开" + scratchCount + "张，共+" + totalEnergyGram + "g");
+            }
+        } catch (Throwable t) {
+            Log.err(TAG, "scratchCard err:", t);
         }
     }
 

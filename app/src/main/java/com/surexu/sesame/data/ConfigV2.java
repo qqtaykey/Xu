@@ -157,8 +157,17 @@ public class ConfigV2 {
     }
 
     public static synchronized Boolean save(String userId, Boolean force) {
+        // 硬闸：本进程从未成功加载过配置（或已被 unload/clear）时一律拒绝落盘。
+        // 此刻内存里只有代码默认值，而默认值几乎全是关闭——写下去等于把用户配置整份清空，
+        // 第二天起来就是「配置没了、模块也关了」。跨天 sweep 等链路会主动触发 save，
+        // 未加载窗口期一旦命中就是致命的，所以这里必须无条件拦。
+        if (!INSTANCE.isInit()) {
+            Log.record("配置尚未加载，已拒绝保存以免默认值覆盖磁盘: " + (StringUtil.isEmpty(userId) ? "默认" : userId));
+            return false;
+        }
         // 本进程没有任何字段级改动时直接返回：写盘只会把磁盘上本进程不认识的键整份覆盖丢失
         if (!valueBaseline.isEmpty() && collectChangedFields().isEmpty()) {
+
             return true;
         }
         if (!force && !isModify(userId)) {
@@ -171,8 +180,9 @@ public class ConfigV2 {
         }
         String json = INSTANCE.toSaveStr();
         // 写盘前固定留一份上一版（覆盖式即时快照），与「每日一次」的滚动备份解耦
-        FileUtil.backupConfigV2BeforeWrite(userId);
-        FileUtil.backupConfigV2WithRolling(StringUtil.isEmpty(userId) ? "默认" : userId);
+            FileUtil.backupConfigV2BeforeWrite(userId);
+            FileUtil.backupConfigV2WithRolling(StringUtil.isEmpty(userId) ? FileUtil.DEFAULT_USER_KEY : userId);
+
         boolean success;
         if (StringUtil.isEmpty(userId)) {
             userId = "默认";
@@ -238,16 +248,20 @@ public class ConfigV2 {
             }
         } catch (Throwable t) {
             Log.printStackTrace(TAG, t);
-            // 解析失败先用滚动备份兜底恢复，恢复不了才重置为默认（原来直接重置，整份配置就没了）
+            // 解析失败：按「写盘前快照 → 全部滚动备份（新到旧）」逐个尝试，直到拿到一份能解析的完整配置。
             if (!restoreFromBackup(configV2File, userId)) {
-                Log.i(TAG, "重置配置: " + userName);
+                // 一份可用备份都没有时，绝不写默认配置覆盖磁盘：默认值几乎全是关闭，
+                // 写下去用户看到的就是「配置消失、模块自动关闭」。改为保留原文件（另存一份损坏副本供排查）
+                // 并置回「未加载」——此后 save() 一律拒绝、任务不启动，宁可不动也不能用默认值静默运行。
+                FileUtil.keepBrokenConfigCopy(configV2File);
                 INSTANCE.setModelFieldsMap(null);
                 unload();
-                if (configV2File != null) {
-                    FileUtil.write2File(INSTANCE.toSaveStr(), configV2File);
-                }
+                Log.error("配置解析失败且无可用备份，已保留原文件（副本见 bak/），本次不加载配置: " + userName);
+                Log.record("加载配置结束(未加载): " + userName);
+                return INSTANCE;
             }
         }
+
         clampAllFields();
         INSTANCE.setInit(true);
         captureBaseline();
@@ -265,7 +279,13 @@ public class ConfigV2 {
                 }
             }
         }
+        // 卸载后内存里只剩代码默认值：置回「未加载」并清掉同步基线，
+        // 否则紧接的任何一次 save()（换号 / 跨天 / 页面保存）都会把默认值整份写盘
+        INSTANCE.setInit(false);
+        valueBaseline.clear();
+        lastSyncedText = null;
     }
+
 
     /**
      * 按各字段自身的刻度语义夹一遍越界值。Jackson 只认 value 属性、直接写字段，
@@ -286,30 +306,44 @@ public class ConfigV2 {
      * 备份里存的就是完整的 config_v2 内容，所以恢复后可以直接写回主配置文件。
      */
     private static boolean restoreFromBackup(File configV2File, String userId) {
+        // 逐个候选尝试（写盘前快照 → 滚动备份新到旧）：某一份损坏时还能用更早的那一份，
+        // 避免「只试最新一份，失败就退回默认配置」。
+        for (File source : FileUtil.listRecoveryCandidates(userId)) {
+            if (restoreFrom(configV2File, source)) {
+                return true;
+            }
+        }
+        Log.error("未找到可用备份: " + (StringUtil.isEmpty(userId) ? "默认" : userId));
+        return false;
+    }
+
+    /** 从指定备份文件恢复：先清回完全初始态再套备份，避免半解析残留值混入，最后写回主配置 */
+    private static boolean restoreFrom(File configV2File, File source) {
         try {
-            // save() 落盘时把空 userId 归一成"默认"，备份文件名跟着用这个，这里保持一致
-            File backupFile = FileUtil.findLatestBackupFile(StringUtil.isEmpty(userId) ? "默认" : userId);
-            if (backupFile == null || !backupFile.exists()) {
+            if (source == null || !source.exists() || source.equals(configV2File)) {
                 return false;
             }
-            String json = FileUtil.readFromFile(backupFile);
+            String json = FileUtil.readFromFile(source);
             if (StringUtil.isEmpty(json)) {
+                Log.error("备份文件为空: " + source.getPath());
                 return false;
             }
-            // 先重建为代码里的默认值再套备份，避免主文件"半解析"后的残留值混进来
+            // 先回到干净状态：不彻底清空的话，解析异常时可能留下「解析了一半 + 默认值」的混合配置
             INSTANCE.setModelFieldsMap(null);
             unload();
             JsonUtil.copyMapper().readerForUpdating(INSTANCE).readValue(json);
             if (configV2File != null) {
                 FileUtil.write2File(INSTANCE.toSaveStr(), configV2File);
             }
-            Log.record("配置解析失败，已从备份恢复: " + backupFile.getName());
+            Log.record("成功从备份恢复配置: " + source.getName());
             return true;
         } catch (Throwable t) {
             Log.printStackTrace(TAG, t);
+            Log.error("从备份恢复失败: " + source.getName());
             return false;
         }
     }
+
 
     /**
      * 值的稳定文本形式：集合/映射先排序再拼接，避免顺序抖动把「没改」误判成「本进程改过」，

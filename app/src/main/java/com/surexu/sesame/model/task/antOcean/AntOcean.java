@@ -44,6 +44,13 @@ public class AntOcean extends ModelTask {
     private static final String TAG = AntOcean.class.getSimpleName();
 
     /**
+     * 服务端返回「未开启」时是否自动把本地开关改掉（默认关闭：只提示、不改写）。
+     * 接口偶发异常/风控返回也会走同一分支，直接回写开关等于把功能永久关掉。
+     */
+    public static Boolean autoDisableWhenServerClosed = false;
+
+
+    /**
      * 获取任务名称
      *
      * @return 海洋任务名称
@@ -157,12 +164,18 @@ public class AntOcean extends ModelTask {
             JSONObject jo = new JSONObject(AntOceanRpcCall.queryOceanStatus());
             if (MessageUtil.checkResultCode(TAG, jo)) {
                 if (!jo.getBoolean("opened")) {
-                    getEnableField().setValue(false);
                     Log.record("请先开启神奇海洋，并完成引导教程");
+                    // 同农场：接口偶发异常/风控返回也会进这个分支，静默回写开关 = 功能永久关闭
+                    if (autoDisableWhenServerClosed) {
+                        getEnableField().setValue(false);
+                    } else {
+                        Log.record("服务端显示神奇海洋未开启，仅提示，本次不改写本地开关");
+                    }
                     return false;
                 }
                 return true;
             }
+
         } catch (Throwable t) {
             Log.err(TAG, "queryOceanStatus err:", t);
         }

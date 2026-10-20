@@ -30,6 +30,17 @@ public class FileUtil {
     private static final String BACKUP_DIR_NAME = "bak"; // 备份子目录名
     public static final String BACKUP_FILE_PREFIX = "config_v2_";
     public static final String BACKUP_FILE_EXT = ".json";
+    /** 写盘前即时快照的文件名前缀（按账号区分，避免多账号互相覆盖） */
+    public static final String PREV_SNAPSHOT_PREFIX = "config_v2.prev";
+    /** 旧版写盘前快照文件名（不带账号标识，只读兼容，不再写入） */
+    public static final String LEGACY_PREV_SNAPSHOT_NAME = "config_v2.prev.json";
+    /** 配置损坏时留存副本的文件名前缀 */
+    public static final String CORRUPT_FILE_PREFIX = "config_v2.corrupt.";
+    /** 备份文件里的默认账号标识：空 userId 统一用它，避免各调用方有的写「默认」有的写 default */
+    public static final String DEFAULT_USER_KEY = "默认";
+    /** 历史遗留的默认账号标识（旧版本写下的 default），查找时兼容 */
+    private static final String LEGACY_DEFAULT_USER_KEY = "default";
+
     
     /**
      * 从 BaseModel 动态读取备份保留份数（核心修改）
@@ -85,20 +96,21 @@ public class FileUtil {
      * @param userId 用户ID（空则为默认用户）
      */
     public static boolean isConfigV2BackedUpTodayForUser(String userId) {
-        String safeUserId = StringUtil.isEmpty(userId) ? "default" : userId;
-        File backupDir = getBackupDirectoryFile();
         int maxCount = getBackupMaxCountFromConfig(); // 动态获取份数
-        
-        // 遍历所有可能的备份后缀（A/B/C...）
-        for (int i = 0; i < maxCount; i++) {
-            String suffix = getBackupSuffix(i);
-            File backupFile = new File(backupDir, BACKUP_FILE_PREFIX + safeUserId + "_" + suffix + BACKUP_FILE_EXT);
-            if (backupFile.exists() && isFileModifiedToday(backupFile)) {
-                return true; // 当天已有备份
+
+        // 遍历所有可能的备份后缀（A/B/C...）；空 userId 兼容新旧两种默认账号前缀
+        for (String userKey : backupUserKeys(userId)) {
+            for (int i = 0; i < maxCount; i++) {
+                String suffix = getBackupSuffix(i);
+                File backupFile = new File(getBackupDirectoryFile(), BACKUP_FILE_PREFIX + userKey + "_" + suffix + BACKUP_FILE_EXT);
+                if (backupFile.exists() && isFileModifiedToday(backupFile)) {
+                    return true; // 当天已有备份
+                }
             }
         }
         return false;
     }
+
     
     /**
      * 判断文件是否为当天修改（复用项目日志工具的日期格式化）
@@ -128,7 +140,8 @@ public class FileUtil {
      * @param userId 用户ID（空则为默认用户）
      */
     private static File findNextBackupFileForUser(String userId) {
-        String safeUserId = StringUtil.isEmpty(userId) ? "default" : userId;
+        String safeUserId = StringUtil.isEmpty(userId) ? DEFAULT_USER_KEY : userId;
+
         File backupDir = getBackupDirectoryFile();
         int maxCount = getBackupMaxCountFromConfig(); // 动态获取份数
         
@@ -169,7 +182,10 @@ public class FileUtil {
             if (!originalFile.exists()) {
                 return;
             }
-            File prevFile = new File(originalFile.getParentFile(), "config_v2.prev.json");
+            // 必须按账号区分：不带账号标识时，B 账号写盘会把 A 账号的快照刷掉，
+            // A 账号配置损坏时就可能拿 B 账号的配置去恢复（配置串号）
+            File prevFile = getPrevSnapshotFile(userId);
+
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                 Files.copy(originalFile.toPath(), prevFile.toPath(), StandardCopyOption.REPLACE_EXISTING);
             }
@@ -185,33 +201,38 @@ public class FileUtil {
      */
     public static void backupConfigV2WithRolling(String userId) {
         BACKUP_MAX_COUNT = getBackupMaxCountFromConfig();
+        // 备份标识先归一：空 userId 统一成「默认」，与 ConfigV2 写盘用的标识一致。
+        // 之前调用方传空 uid 会写出 config_v2_default_*，与 config_v2_默认_* 两套并存，
+        // 恢复时只按其中一个前缀找就可能找不到备份。
+        final String userKey = StringUtil.isEmpty(userId) ? DEFAULT_USER_KEY : userId;
         // 1. 校验：当天已备份则跳过
-        if (isConfigV2BackedUpTodayForUser(userId)) {
-            Log.record(FileUtil.class.getSimpleName()+"#用户[" + (StringUtil.isEmpty(userId) ? "default" : userId) + "]当天已备份，跳过");
+        if (isConfigV2BackedUpTodayForUser(userKey)) {
+            Log.record(FileUtil.class.getSimpleName() + "#用户[" + userKey + "]当天已备份，跳过");
             return;
         }
-        
+
         // 2. 获取原配置文件
         File originalFile = StringUtil.isEmpty(userId) ? getDefaultConfigV2File() : getConfigV2File(userId);
         if (!originalFile.exists()) {
             Log.error("原配置文件不存在，跳过备份: " + originalFile.getPath());
             return;
         }
-        
+
         // 3. 找到该用户下一个要使用的备份文件（按A→B→C顺序）
-        File targetFile = findNextBackupFileForUser(userId); // 替换为新的方法
-        
+        File targetFile = findNextBackupFileForUser(userKey);
+
         // 5. 执行备份（覆盖目标文件）
         try {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                 Files.copy(originalFile.toPath(), targetFile.toPath(), StandardCopyOption.REPLACE_EXISTING);
             }
-            Log.record("备份成功🔄配置覆盖滚动" + BACKUP_MAX_COUNT + "次循环#用户:" + (StringUtil.isEmpty(userId) ? "default" : com.surexu.sesame.util.idMap.UserIdMap.getAccountLabel(userId)) + "#备份文件:" + getBackupDirectoryFile().getPath() + "/" + targetFile.getName());
+            Log.record("备份成功🔄配置覆盖滚动" + BACKUP_MAX_COUNT + "次循环#用户:" + (StringUtil.isEmpty(userId) ? userKey : com.surexu.sesame.util.idMap.UserIdMap.getAccountLabel(userId)) + "#备份文件:" + getBackupDirectoryFile().getPath() + "/" + targetFile.getName());
         } catch (IOException e) {
             Log.printStackTrace(FileUtil.class.getSimpleName(), e);
-            Log.error("备份失败|用户: " + (StringUtil.isEmpty(userId) ? "default" : userId) + "|原因: " + e.getMessage());
+            Log.error("备份失败|用户: " + userKey + "|原因: " + e.getMessage());
         }
     }
+
     
     /**
      * 查找最新的备份文件
@@ -219,27 +240,81 @@ public class FileUtil {
      * @return 最新的备份文件
      */
     public static File findLatestBackupFile(String userId) {
-        String safeUserId = StringUtil.isEmpty(userId) ? "default" : userId;
+        java.util.List<File> files = listBackupFilesForUser(userId);
+        return files.isEmpty() ? null : files.get(0);
+    }
+
+    /**
+     * 备份文件里的「用户标识」候选：空 userId 统一用 DEFAULT_USER_KEY（「默认」），
+     * 同时兼容历史遗留的 default 前缀——两套前缀曾因调用方不一致而并存，只按其中一个查会漏掉另一套。
+     */
+    private static String[] backupUserKeys(String userId) {
+        if (!StringUtil.isEmpty(userId)) {
+            return new String[]{userId};
+        }
+        return new String[]{DEFAULT_USER_KEY, LEGACY_DEFAULT_USER_KEY};
+    }
+
+    /** 写盘前即时快照文件（按账号区分，与滚动备份同在 bak/ 下） */
+    public static File getPrevSnapshotFile(String userId) {
+        String userKey = StringUtil.isEmpty(userId) ? DEFAULT_USER_KEY : userId;
+        return new File(getBackupDirectoryFile(), PREV_SNAPSHOT_PREFIX + "." + userKey + BACKUP_FILE_EXT);
+    }
+
+    /** 该账号在 bak/ 下的全部滚动备份，按修改时间从新到旧 */
+    public static java.util.List<File> listBackupFilesForUser(String userId) {
+        java.util.List<File> files = new java.util.ArrayList<>();
         File backupDir = getBackupDirectoryFile();
         int maxCount = getBackupMaxCountFromConfig();
-        
-        File latestFile = null;
-        long latestTime = 0;
-        
-        for (int i = 0; i < maxCount; i++) {
-            String suffix = getBackupSuffix(i);
-            File file = new File(backupDir, BACKUP_FILE_PREFIX + safeUserId + "_" + suffix + BACKUP_FILE_EXT);
-            if (file.exists()) {
-                long fileTime = file.lastModified();
-                if (fileTime > latestTime) {
-                    latestTime = fileTime;
-                    latestFile = file;
+        for (String userKey : backupUserKeys(userId)) {
+            for (int i = 0; i < maxCount; i++) {
+                File file = new File(backupDir, BACKUP_FILE_PREFIX + userKey + "_" + getBackupSuffix(i) + BACKUP_FILE_EXT);
+                if (file.exists()) {
+                    files.add(file);
                 }
             }
         }
-        
-        return latestFile;
+        files.sort((a, b) -> Long.compare(b.lastModified(), a.lastModified()));
+        return files;
     }
+
+    /**
+     * 该账号全部可用的恢复源，按优先级：新的写盘前快照 → 旧的写盘前快照（仅默认账号）
+     * → 全部滚动备份（新到旧）。主配置解析失败时按序逐个尝试，避免只试一份就退化到默认配置。
+     */
+    public static java.util.List<File> listRecoveryCandidates(String userId) {
+        java.util.List<File> candidates = new java.util.ArrayList<>();
+        File snapshot = getPrevSnapshotFile(userId);
+        if (snapshot.exists()) {
+            candidates.add(snapshot);
+        }
+        if (StringUtil.isEmpty(userId)) {
+            File legacySnapshot = new File(getBackupDirectoryFile(), LEGACY_PREV_SNAPSHOT_NAME);
+            if (legacySnapshot.exists()) {
+                candidates.add(legacySnapshot);
+            }
+        }
+        candidates.addAll(listBackupFilesForUser(userId));
+        return candidates;
+    }
+
+    /** 配置解析失败时把损坏内容另存一份到 bak/ 供排查；只复制，不删改原文件 */
+    public static void keepBrokenConfigCopy(File brokenFile) {
+        try {
+            if (brokenFile == null || !brokenFile.exists()) {
+                return;
+            }
+            String stamp = new SimpleDateFormat("yyyyMMddHHmmss", Locale.getDefault()).format(new Date());
+            File copy = new File(getBackupDirectoryFile(), CORRUPT_FILE_PREFIX + stamp + BACKUP_FILE_EXT);
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                Files.copy(brokenFile.toPath(), copy.toPath(), StandardCopyOption.REPLACE_EXISTING);
+            }
+            Log.record("配置损坏，已留存副本: " + copy.getPath());
+        } catch (Exception e) {
+            Log.printStackTrace(FileUtil.class.getSimpleName(), e);
+        }
+    }
+
     
     @SuppressWarnings("deprecation")
     private static File getMainDirectoryFile() {

@@ -148,7 +148,9 @@ public class AntOrchardRpcCall {
     }
 
     public static String yebPlantSceneRevenuePage() {
-        return ApplicationHook.requestString("com.alipay.gamecenteruprod.biz.rpc.v3.yebPlantSceneRevenuePage", "[{\"requestType\":\"NORMAL\",\"sceneCode\":\"ORCHARD\",\"source\":\"ANTFARM_ORCHARD\"}]");
+        // gamecenteruprod 系列接口不吃 sceneCode（那是 antorchard 系列的参数），传 ORCHARD 会被服务端
+        // 判为 error 3000「系统出错」；同系列的 queryPointBallList 用极简参数即可
+        return ApplicationHook.requestString("com.alipay.gamecenteruprod.biz.rpc.v3.yebPlantSceneRevenuePage", "[{}]");
     }
 
     public static String triggerYebMoneyTree() {
@@ -177,7 +179,9 @@ public class AntOrchardRpcCall {
 
     /* ==================== 农场轮盘/抽抽乐：做任务抽奖（阿肥寻宝记，2026-09-30 抓包） ==================== */
 
-    /** 进入轮盘活动页：拿 activityId 与剩余抽奖次数 drawAsset.blance */
+    /** 进入轮盘活动页：拿 activityId 与剩余抽奖次数 drawAsset.blance
+     *  appMode 用本地抓包值 student；上游 1.4.4 从 INT 改回 normal（其 1.4.3 曾用 INT 导致抽抽乐"从未执行"），
+     *  如遇空列表/4xx 可把下面几处 appMode 试改为 normal */
     public static String enterDrawActivityantorchard(String activityId, String sceneCode, String source) {
         return ApplicationHook.requestString("com.alipay.antiepdrawprod.enterDrawActivityantorchard", "[{\"activityId\":\"" + activityId + "\",\"context\":{\"appMode\":\"student\"},\"requestType\":\"RPC\",\"sceneCode\":\"" + sceneCode + "\",\"source\":\"" + source + "\"}]");
     }

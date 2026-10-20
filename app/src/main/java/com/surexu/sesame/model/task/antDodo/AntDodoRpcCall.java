@@ -17,6 +17,16 @@ public class AntDodoRpcCall {
                 "[{}]");
     }
 
+    /**
+     * 刮刮卡：animalId/bookId 取自 homePage 的 curCollection[].animal，
+     * cardInstanceId 取自同一图鉴条目的 collectDetail.cardList[]
+     */
+    public static String scratchCard(String animalId, String bookId, String cardInstanceId) {
+        return ApplicationHook.requestString("alipay.antdodo.rpc.h5.scratchCard",
+                "[{\"animalId\":\"" + animalId + "\",\"bookId\":\"" + bookId
+                        + "\",\"cardInstanceId\":\"" + cardInstanceId + "\"}]");
+    }
+
     public static String taskEntrance() {
         return ApplicationHook.requestString("alipay.antdodo.rpc.h5.taskEntrance",
                 "[{\"statusList\":[\"TODO\",\"FINISHED\"]}]");

@@ -330,7 +330,10 @@ public class Status {
                 if (wateredFriendField != null) {
                     wateredFriendField.setObjectValue(configWateredFriendList);
                     String currentUid = UserIdMap.getCurrentUid();
-                    ConfigV2.save(currentUid, true);
+                    // force=true 会绕过「磁盘没变就跳过」判断，把内存整份写回磁盘；
+                    // 一旦此刻内存是默认值（未加载/换号窗口），就成了「默认配置覆盖用户配置」。
+                    ConfigV2.save(currentUid, false);
+
                     Log.forest("填入被水🍯完成新增" + addedCount + "个更新" + updatedCount + "个清除" + removedCount + "个");
                 }
             }

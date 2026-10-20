@@ -142,15 +142,31 @@ public abstract class Model {
         // 而 ConfigV2.INSTANCE.isInit() 置 true 后不再重新 load，若不同步会出现 UI 读新字段、
         // save() 写旧引用的错位，表现为"开关打开保存后返回又自动关闭"。
         try {
-            // 注意：setModelFieldsMap 内部会先 clear 传入的 map，必须传副本，否则旧值全丢
-            ConfigV2.INSTANCE.setModelFieldsMap(new java.util.HashMap<>(ConfigV2.INSTANCE.getModelFieldsMap()));
+            java.util.Map<String, ModelFields> snapshot = ConfigV2.INSTANCE.getModelFieldsMap();
+            if (snapshot == null || snapshot.isEmpty()) {
+                // 配置还没加载（或刚被 clear/unload）：把空快照同步过去会让所有字段退回代码默认值
+                // （默认值几乎全是关闭），表现就是「配置全没了、模块自己关了」。
+                // 保持刚重建的字段不动，等真正的 load 把值填进来。
+                Log.record("配置尚未加载，跳过重建字段的值同步");
+            } else {
+                // 注意：setModelFieldsMap 内部会先 clear 传入的 map，必须传副本，否则旧值全丢
+                ConfigV2.INSTANCE.setModelFieldsMap(new java.util.HashMap<>(snapshot));
+            }
         } catch (Exception e) {
             Log.printStackTrace(e);
         }
     }
 
+
     public static synchronized void bootAllModel(ClassLoader classLoader) {
+        // 配置没加载成功时不允许按「默认值」启动任务：默认值几乎全关，启动只会跑出一堆无效请求，
+        // 而用户看到的是「功能全被关了」。等配置加载好再启动。
+        if (!ConfigV2.INSTANCE.isInit()) {
+            Log.record("配置尚未加载，跳过全部任务启动");
+            return;
+        }
         for (Model model : modelArray) {
+
             try {
                 model.prepare();
             } catch (Exception e) {

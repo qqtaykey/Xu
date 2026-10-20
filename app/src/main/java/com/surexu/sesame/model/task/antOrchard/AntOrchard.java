@@ -54,6 +54,13 @@ public class AntOrchard extends ModelTask {
     private static final String TAG = "AntOrchard";
     private static final String NAME = "农场";
     private static final ModelGroup GROUP = ModelGroup.ORCHARD;
+
+    /**
+     * 服务端返回「未开启」时是否自动把本地开关改掉（默认关闭：只提示、不改写）。
+     * 接口偶发异常/风控返回也会走同一分支，直接回写开关等于把功能永久关掉。
+     */
+    public static Boolean autoDisableWhenServerClosed = false;
+
     private String[] wuaList;
     private String userId;
 
@@ -90,6 +97,7 @@ public class AntOrchard extends ModelTask {
 
     private BooleanModelField orchardPlantNew;
     private BooleanModelField drawGameCenterAward;
+    private BooleanModelField receiveOrchardGameStay;
     private BooleanModelField orchardChouChouLe;
     private BooleanModelField AutoOrchardChouChouLeTaskList;
     private SelectModelField OrchardChouChouLeTaskList;
@@ -129,6 +137,7 @@ public class AntOrchard extends ModelTask {
                 .setDependsOn("orchardSpreadManure")
                 .setDescription("按轮计：设为200并开一键施肥5次时突破到204；设为其他数值则设置多少施肥多少（不批量）"));
         modelFields.addField(drawGameCenterAward = new BooleanModelField("drawGameCenterAward", "农场乐园 | 游戏宝箱", true));
+        modelFields.addField(receiveOrchardGameStay = new BooleanModelField("receiveOrchardGameStay", "游戏时长任务 | 开启", false));
         modelFields.addField(orchardChouChouLe = new BooleanModelField("orchardChouChouLe", "抽抽乐(阿肥寻宝记)", false));
         modelFields.addField(AutoOrchardChouChouLeTaskList = new BooleanModelField("AutoOrchardChouChouLeTaskList", "抽抽乐任务 | 自动黑名单", true).setDependsOn("orchardChouChouLe"));
         modelFields.addField(OrchardChouChouLeTaskList = new SelectModelField("OrchardChouChouLeTaskList", "抽抽乐任务 | 黑名单列表", new LinkedHashSet<>(), AlipayOrchardChouChouLeTaskList::getList).setDependsOn("AutoOrchardChouChouLeTaskList"));
@@ -185,6 +194,11 @@ public class AntOrchard extends ModelTask {
                 orchardChouChouLe();
             }
 
+            // 完成游戏时长任务: 极速模拟游玩悬浮球游戏领肥料
+            if (receiveOrchardGameStay.getValue()) {
+                AntOrchardGameStayTask.execute();
+            }
+
         } catch (Throwable t) {
             Log.err(TAG, "start.run err:", t);
         }
@@ -201,10 +215,16 @@ public class AntOrchard extends ModelTask {
             }
 
             if (!jo.optBoolean("userOpenOrchard")) {
-                getEnableField().setValue(false);
                 Log.record("请先开启芭芭农场！");
+                // 接口偶发异常/风控返回也会进这个分支，直接回写开关等于把功能关掉（且随即落盘）
+                if (autoDisableWhenServerClosed) {
+                    getEnableField().setValue(false);
+                } else {
+                    Log.record("服务端显示农场未开启，仅提示，本次不改写本地开关");
+                }
                 return false;
             }
+
 
             // 处理七日礼包
             if (jo.has("lotteryPlusInfo")) {
@@ -294,23 +314,9 @@ public class AntOrchard extends ModelTask {
                     // 但下一轮可再试——服务端状态推进有延迟，跨轮仍可能落到新阶段
                     String attemptKey = taskType + "#" + rightsTimes + "@" + round;
 
-                    // 黑名单任务跳过
-                    if (AntOrchardTaskList.getValue().contains(title)) {
-                        continue;
-                    }
-                    // 底线：硬交易/支付/充值类一律不申报、一次即永久拉黑，绝不伪造。
-                    // 软判据（_cz 数字等疑似充值）放行：限定活动实测部分可通过伪申报完成，
-                    // 失败/风控由 TaskAttemptPolicy 的自动黑名单兜底。
-                    if (TaskAlternative.isTransactionTaskHard(taskType)
-                            || TaskAlternative.isTransactionTaskHard(groupId)
-                            || TaskAlternative.isTransactionTaskHard(sceneCode)) {
-                        MessageUtil.MarkTaskBlackListPermanent("AntOrchard", "AntOrchardTaskList",
-                                "农场乐园限定任务", title);
-                        Log.farm("农场乐园⏭️交易/履约类[" + title + "]#不申报，已永久拉黑");
-                        continue;
-                    }
-
-                    // 已完成待领：领奖。已领满（awardCountForReceive<=0）不再重复请求
+                    // 已完成待领：领奖。已领满（awardCountForReceive<=0）不再重复请求。
+                    // 领奖必须放在黑名单检查之前：黑名单只表示"不再尝试完成"，不应阻止领取已完成任务的奖励。
+                    // 原顺序（黑名单在前）会让"每日砸金蛋10次"这类已完成(FINISHED)但被拉黑的任务永远领不到奖。
                     if (TaskStatus.FINISHED.name().equals(taskStatus)) {
                         if (awardCountForReceive > 0 && attempted.add(attemptKey + "-award")) {
                             progressed = true;
@@ -331,6 +337,22 @@ public class AntOrchard extends ModelTask {
                                         msg -> Log.farm(msg));
                             }
                         }
+                        continue;
+                    }
+
+                    // 黑名单任务跳过（只拦截待完成任务的申报；领奖已在上面处理，不受黑名单影响）
+                    if (AntOrchardTaskList.getValue().contains(title)) {
+                        continue;
+                    }
+                    // 底线：硬交易/支付/充值类一律不申报、一次即永久拉黑，绝不伪造。
+                    // 软判据（_cz 数字等疑似充值）放行：限定活动实测部分可通过伪申报完成，
+                    // 失败/风控由 TaskAttemptPolicy 的自动黑名单兜底。
+                    if (TaskAlternative.isTransactionTaskHard(taskType)
+                            || TaskAlternative.isTransactionTaskHard(groupId)
+                            || TaskAlternative.isTransactionTaskHard(sceneCode)) {
+                        MessageUtil.MarkTaskBlackListPermanent("AntOrchard", "AntOrchardTaskList",
+                                "农场乐园限定任务", title);
+                        Log.farm("农场乐园⏭️交易/履约类[" + title + "]#不申报，已永久拉黑");
                         continue;
                     }
 
@@ -478,7 +500,16 @@ public class AntOrchard extends ModelTask {
         try {
             String res = AntOrchardRpcCall.enterDrawActivityantorchard("", "ANTORCHARD_DRAW_TIMES", "antorchard");
             JSONObject resData = new JSONObject(res);
-            if (!MessageUtil.checkSuccess(TAG, resData)) {
+            // 该接口只回 code=100000000 + desc=处理成功，没有 success 字段，checkSuccess 会误判失败，
+            // 导致抽抽乐"从未执行"（拿不到任何场景就直接 return）
+            if (!"100000000".equals(resData.optString("code")) && !MessageUtil.checkSuccess(TAG, resData)) {
+                return;
+            }
+            // 当前响应把 drawActivity 直接放在顶层（对象，非数组）；旧结构才是 drawSceneGroups/drawScene
+            JSONObject drawActivity = resData.optJSONObject("drawActivity");
+            if (drawActivity != null) {
+                orchardChouChouLeScene(drawActivity.optString("activityId"),
+                        drawActivity.optString("name"), drawActivity.optString("sceneCode"));
                 return;
             }
             JSONArray drawSceneGroups = resData.optJSONArray("drawSceneGroups");
@@ -497,14 +528,12 @@ public class AntOrchard extends ModelTask {
                 if (drawScene == null) {
                     continue;
                 }
-                JSONObject drawActivity = drawScene.optJSONObject("drawActivity");
-                if (drawActivity == null) {
+                JSONObject inner = drawScene.optJSONObject("drawActivity");
+                if (inner == null) {
                     continue;
                 }
-                String activityId = drawActivity.optString("activityId");
-                String drawScenename = drawActivity.optString("name");
-                String sceneCode = drawActivity.optString("sceneCode");
-                orchardChouChouLeScene(activityId, drawScenename, sceneCode);
+                orchardChouChouLeScene(inner.optString("activityId"),
+                        inner.optString("name"), inner.optString("sceneCode"));
             }
         } catch (Throwable t) {
             Log.err(TAG, "orchardChouChouLe err:", t);
@@ -580,12 +609,14 @@ public class AntOrchard extends ModelTask {
                                 doublecheck = true;
                             }
                         } else {
-                            // 领奖收口：先按任务列表复核"已领到"，未确认才交自动拉黑（顺序由 TaskAward 固定）
-                            TaskAward.confirmReceivedOrBlackList("农场抽抽乐🎖️",
+                            // 领奖响应失败：先按列表复核"已领到"；未确认也不拉黑——
+                            // 这是已获得的奖励（任务已完成），临时失败下轮重试即可，拉黑会让它3天不再领
+                            boolean received = TaskAward.confirmReceivedOrBlackList("农场抽抽乐🎖️",
                                     k -> probeOrchardChouChouLeStatus(sceneCode, taskSceneCode, taskType), taskName,
-                                    taskName,
-                                    () -> MessageUtil.checkResultCodeAndMarkTaskBlackList("OrchardChouChouLeTaskList", taskName, sginRes),
-                                    msg -> Log.farm(msg));
+                                    taskName, null, msg -> Log.farm(msg));
+                            if (!received) {
+                                Log.farm("农场抽抽乐🎖️[" + taskName + "]#领奖失败，下轮重试");
+                            }
                         }
                     } else if ("TODO".equals(taskStatus)) {
                         // 一次补齐：同一轮内按剩余次数连做，打满即止（与庄园抽抽乐同一形态）
@@ -1709,13 +1740,19 @@ public class AntOrchard extends ModelTask {
                 if ("I".equals(revenue.getString("orderStatus"))) {
                     String triggerResult = AntOrchardRpcCall.triggerYebMoneyTree();
                     JSONObject triggerJo = new JSONObject(triggerResult);
-                    if (MessageUtil.checkResultCode(TAG, triggerJo)) {
-                        JSONObject awardInfo = triggerJo.getJSONObject("result").optJSONObject("awardInfo");
-                        if (awardInfo != null) {
-                            String amount = awardInfo.getString("totalAmount");
-                            Log.farm("芭芭农场🌳领取奖励[摇钱树]#获得[" + amount + "元余额宝收益]");
-                        }
+                    // 该接口响应内容在 result 对象里（外层无 resultCode/success），checkResultCode 会误判失败，
+                    // 故优先看 result 是否存在；无 result 时才退回通用判定
+                    JSONObject triggerRes = triggerJo.optJSONObject("result");
+                    if (triggerRes == null && !MessageUtil.checkResultCode(TAG, triggerJo)) {
+                        Log.record("摇钱树触发未成功："
+                                + (triggerResult.length() > 200 ? triggerResult.substring(0, 200) : triggerResult));
+                        continue;
                     }
+                    // 只记"已受理"：金额是触发响应当次返回的值，不作为"已到账收益"上报
+                    JSONObject awardInfo = triggerRes == null ? null : triggerRes.optJSONObject("awardInfo");
+                    String amount = awardInfo == null ? "" : awardInfo.optString("totalAmount", "");
+                    Log.farm("芭芭农场🌳领取奖励[摇钱树]#已受理"
+                            + (amount.length() == 0 ? "" : "#获得[" + amount + "元余额宝收益]"));
                 }
             }
         } catch (Throwable t) {

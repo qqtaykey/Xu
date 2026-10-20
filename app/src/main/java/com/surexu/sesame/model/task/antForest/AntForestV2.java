@@ -261,6 +261,7 @@ public class AntForestV2 extends ModelTask implements EnergyCollectCallback {
     private BooleanModelField youthPrivilege;
     private SelectModelField ecoLifeOptions;
     private BooleanModelField dress;
+    private BooleanModelField readForest;
     private TextModelField dressDetailList;
 
     private static int totalCollected = 0;
@@ -390,6 +391,7 @@ public class AntForestV2 extends ModelTask implements EnergyCollectCallback {
         modelFields.addField(NORMALForestHuntHelp = new BooleanModelField("NORMALForestHuntHelp", "普通场景强制助力" + "(助力任务不在列表中时使用，如果日志显示失效请关闭)", false).setDependsOn("ForestHunt"));
         modelFields.addField(ACTIVITYForestHuntHelp = new BooleanModelField("ACTIVITYForestHuntHelp", "活动场景强制助力" + "(同上)", false).setDependsOn("ForestHunt"));
         modelFields.addField(ForestHuntHelpList = new SelectModelField("ForestHuntHelpList", "点击配置寻宝助力列表" + "(填写shareId中开头的22-24位字符在\"4O7FEYDgn\"前的)", new LinkedHashSet<>(), AlipayForestHunt::getList).setDependsOn("ForestHunt"));
+        modelFields.addField(readForest = new BooleanModelField("readForest", "无纸阅读", false));
         modelFields.addField(dress = new BooleanModelField("dress", "装扮保护 | 开启", false));
         modelFields.addField(dressDetailList = new TextModelField("dressDetailList", "装扮保护 | " + "装扮信息", "").setDependsOn("dress"));
         modelFields.addField(new EmptyModelField("dressDetailListClear", "装扮保护 | 装扮信息清除", () -> dressDetailList.reset()).setDependsOn("dress"));
@@ -742,6 +744,10 @@ public class AntForestV2 extends ModelTask implements EnergyCollectCallback {
                     queryForestEnergy("FEEDS");
                     // 医疗健康 电子小票 4g*10能量
                     queryForestEnergy("BILL");
+                }
+                // 无纸阅读: 读免费书攒绿色能量
+                if (readForest.getValue()) {
+                    ReadForestTask.execute();
                 }
                 if (dress.getValue()) {
                     dress();
