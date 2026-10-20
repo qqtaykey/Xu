@@ -307,7 +307,7 @@ public final class MtopSender {
             if (args == null) {
                 continue;
             }
-            Object v = tryInvoke(m, null, args);
+            Object v = invokeMethod(m, null, args);
             if (isMtop(v)) {
                 captureInstance(v);
                 return mtopInstance;
@@ -448,7 +448,7 @@ public final class MtopSender {
             if (args == null) {
                 continue;
             }
-            Object b = tryInvoke(m, mtop, args);
+            Object b = invokeMethod(m, mtop, args);
             if (isBuilder(b) && ensureMtopBound(b, mtop)) {
                 return b;
             }
@@ -1041,6 +1041,19 @@ public final class MtopSender {
         }
     }
 
+    /** 调用一个已定位到的 Method(static 时 target 传 null), 失败返回 null。 */
+    private static Object invokeMethod(Method m, Object target, Object[] args) {
+        if (m == null) {
+            return null;
+        }
+        try {
+            m.setAccessible(true);
+            return m.invoke(target, args);
+        } catch (Throwable ignore) {
+            return null;
+        }
+    }
+
     private static boolean callByName(Object target, String name, Object arg) {
         if (target == null) {
             return false;
@@ -1220,8 +1233,8 @@ public final class MtopSender {
         return sb.toString();
     }
 
-    private static String joinNotes(String notes, String headerNote) {
-        return "cfg[" + notes + "] " + headerNote;
+    private static String joinNotes(List<String> notes, String headerNote) {
+        return "cfg[" + join(notes) + "] " + headerNote;
     }
 
     /** 日志脱敏: 只留前 4 位与长度, 避免把 token 完整写进运行日志。 */

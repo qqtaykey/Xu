@@ -61,8 +61,6 @@ public class SesameSports extends ModelTask {
     private static final long FORWARD_INTERVAL_MIN_MS = 1200L;
     private static final long FORWARD_INTERVAL_MAX_MS = 2600L;
 
-    private static final String FLAG_DEBUG_FILE = "sesame_sports_debug.log";
-
     /** 跑前先刷新/领取体力(先领体力再跑) */
     private BooleanModelField autoSupplyPoints;
     /** 自动领取任务中心里已完成但未领取的任务体力(接口名未抓包确认, 默认关闭) */
