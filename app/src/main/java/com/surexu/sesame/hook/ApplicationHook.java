@@ -963,6 +963,8 @@ public class ApplicationHook {
                     XHelpers.hookMember(m, new XC_MethodHook() {
                         @Override
                         protected void afterHookedMethod(MethodHookParam param) throws Throwable {
+                            // 顺势捕获宿主 Mtop 实例/ttid/请求头(含 wua、asac), 供芝麻狗等主动发 MTOP 的模块复用
+                            MtopSender.captureBuilder(param.thisObject, param.args);
                             logMtopRequestDump(param.thisObject, "MTOP");
                             logMtopResponseDump(param);
                         }
@@ -998,6 +1000,7 @@ public class ApplicationHook {
                             // 仅对真正的 MtopBuilder 参数 dump, 避免 Mtop.build 内部半成品请求刷出空 REQ
                             if (param.args != null && param.args.length > 0 && param.args[0] != null
                                     && param.args[0].getClass().getName().equals("mtopsdk.mtop.intf.MtopBuilder")) {
+                                MtopSender.captureBuilder(param.args[0], param.args);
                                 logMtopRequestDump(param.args[0], "MTOP");
                             }
                         }

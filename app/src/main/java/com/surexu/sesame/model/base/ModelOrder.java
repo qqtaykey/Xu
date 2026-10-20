@@ -29,6 +29,8 @@ import com.surexu.sesame.model.task.luckCard.LuckCardStatus;
 import com.surexu.sesame.model.task.other.OtherTask;
 import com.surexu.sesame.model.task.promoprodRewards.PromoprodRewards;
 import com.surexu.sesame.model.task.protectEcology.ProtectEcology;
+import com.surexu.sesame.model.task.sesameDog.SesameDog;
+import com.surexu.sesame.model.task.sesameSports.SesameSports;
 import com.surexu.sesame.model.task.videoRewards.VideoRewards;
 import com.surexu.sesame.model.task.youthPrivilege.YouthPrivilege;
 import lombok.Getter;
@@ -51,6 +53,8 @@ public class ModelOrder {
         clazzList.add(PlantingFlowers.class);
         clazzList.add(AntOcean.class);
         clazzList.add(AntSports.class);
+        clazzList.add(SesameDog.class);
+        clazzList.add(SesameSports.class);
         clazzList.add(AntMember.class);
         clazzList.add(GreenFinance.class);
         clazzList.add(ConsumeGold.class);
