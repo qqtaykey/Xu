@@ -1901,7 +1901,6 @@ public class AntMember extends ModelTask {
             Log.err(TAG, "gameCenterTaskPrize err:", t);
         }
     }
-
     
     /**
      * 查询玩乐豆小球列表，有则领取
