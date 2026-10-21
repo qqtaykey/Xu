@@ -1902,9 +1902,6 @@ public class AntMember extends ModelTask {
         }
     }
 
-        }
-        return "";
-    }
     
     /**
      * 查询玩乐豆小球列表，有则领取
