@@ -63,7 +63,7 @@ public class SesameSports extends ModelTask {
 
     /** 跑前先刷新/领取体力(先领体力再跑) */
     private BooleanModelField autoSupplyPoints;
-    /** 自动领取任务中心里已完成但未领取的任务体力(接口名未抓包确认, 默认关闭) */
+    /** 自动领取任务中心里已完成但未领取的任务奖励(体力/卡币, 接口抓包已确认) */
     private BooleanModelField autoClaimTaskReward;
     /** 体力还有时自动切换到其他城市记录继续跑 */
     private BooleanModelField autoSwitchRecord;
@@ -86,7 +86,7 @@ public class SesameSports extends ModelTask {
     public SesameSports() {
         autoSupplyPoints = new BooleanModelField("autoSupplyPoints", "跑前先领体力(刷新结算)", true);
         autoClaimTaskReward = new BooleanModelField("autoClaimTaskReward",
-                "自动领取任务体力(接口名待真机确认, 失败无害)", false);
+                "自动领取任务奖励(体力/卡币)", true);
         autoSwitchRecord = new BooleanModelField("autoSwitchRecord", "体力富余时自动换城市继续跑", true);
         maxForwardPerRun = new IntegerModelField("maxForwardPerRun", "单轮前进次数上限(保护)",
                 DEFAULT_FORWARD_LIMIT, 1, HARD_FORWARD_LIMIT);
@@ -387,17 +387,38 @@ public class SesameSports extends ModelTask {
                     + "体力), 请在活动页/任务中心点「领取」, 领取后重跑本任务即可用掉这些体力");
             return -1;
         }
+        int gotPoints = 0;
+        int gotKabi = 0;
+        int failed = 0;
         for (SesameSportsRpcCall.TaskItem task : claimable) {
-            MtopSender.Result claim = SesameSportsRpcCall.claimTaskReward(task.taskId, task.pitId);
+            MtopSender.Result claim = SesameSportsRpcCall.claimTaskReward(task.taskId);
             debug("claim:" + task.taskId, describeRaw(claim));
             if (claim != null && claim.ok) {
-                Log.record("体育游乐记: 已领取任务体力 " + task.reward + "(" + task.title + ")");
-                TimeUtil.sleep(600L);
+                int p = SesameSportsRpcCall.claimedPoints(claim);
+                int k = SesameSportsRpcCall.claimedKabi(claim);
+                if (p > 0) {
+                    gotPoints += p;
+                }
+                if (k > 0) {
+                    gotKabi += k;
+                }
+                Log.record("体育游乐记: 已领取任务奖励 " + (p >= 0 ? p + "体力" : "?")
+                        + (k > 0 ? " + " + k + "卡币" : "") + "(" + task.title + ", 任务卡面额 "
+                        + task.reward + "体力; 连续任务按档发放)");
+                TimeUtil.sleep(1500L);
+            } else if (SesameSportsRpcCall.isAlreadyClaimed(claim)) {
+                Log.record("体育游乐记: 任务已领取过, 跳过(" + task.title + ")");
             } else {
+                failed++;
                 warn("claim", claim);
-                Log.record("体育游乐记⚠️ 领取任务体力失败(" + task.title + "): "
+                Log.record("体育游乐记⚠️ 领取任务奖励失败(" + task.title + "): "
                         + (claim == null ? "无响应" : claim.brief() + " | " + claim.note));
             }
+        }
+        if (claimable.size() > 1) {
+            Log.record("体育游乐记: 本轮领奖合计 " + gotPoints + "体力"
+                    + (gotKabi > 0 ? " + " + gotKabi + "卡币" : "")
+                    + (failed > 0 ? ", 失败 " + failed + " 个(详见模块日志)" : ""));
         }
         MtopSender.Result again = SesameSportsRpcCall.refreshPoints();
         debug("refreshPoints2", describeRaw(again));

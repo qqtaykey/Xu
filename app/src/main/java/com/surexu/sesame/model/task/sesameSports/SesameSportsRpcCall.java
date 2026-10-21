@@ -49,14 +49,20 @@ public class SesameSportsRpcCall {
     public static final String API_TASK_MODULE = "mtop.alisports.messi.taskcenter.getTaskModuleInfo";
 
     /**
-     * 任务奖励(体力)领取接口。
+     * 任务奖励(体力/卡币)领取接口。
      *
-     * <p>⚠️ 抓包日志里**没有**出现过领取动作: 真机是在活动页/任务中心(java 侧不可见的 H5 页面)
-     * 点的「领取」。这里的接口名是同类 alisports 任务中心的命名推断, 未经抓包确认,
-     * 因此默认关闭(见任务开关「自动领取任务体力」)。若真机日志显示该调用失败,
-     * 把活动页点「领取」那一刻的抓包补进来即可替换此常量。
+     * <p>2026-10-21 真机抓包实测(shared_log_1792518327707, 点活动页「领取」那一刻):
+     * <ul>
+     *   <li>接口名 {@code mtop.alisports.messi.taskcenter.grant};</li>
+     *   <li>请求体只有 {@code {"taskId":"37477"}} —— 没有 taskActivityId, 也没有 pitId;</li>
+     *   <li>{@code needWua=true}; ret={@code SUCCESS::调用成功};</li>
+     *   <li>返回 {@code data.grantResult.pointNum / kabiNum}(例: 300 体力 + 2 卡币; 连续任务按档发,
+     *       单档 300/500/… 与任务卡上显示的 subAddInfo 总和不是一个数);</li>
+     *   <li>领奖后任务中心该任务 status 由 {@code 1}(已完成待领取) 变为 {@code 2}(已领取),
+     *       receiveCount=1、leftReceiveCount=0。</li>
+     * </ul>
      */
-    public static final String API_CLAIM_TASK = "mtop.alisports.messi.taskcenter.receiveTaskAward";
+    public static final String API_CLAIM_TASK = "mtop.alisports.messi.taskcenter.grant";
 
     /** 需要 token 的调用。 */
     public interface TokenCall {
@@ -254,23 +260,54 @@ public class SesameSportsRpcCall {
         });
     }
 
-    /** 领取已完成任务的体力奖励(接口名未确认, 见 {@link #API_CLAIM_TASK} 说明)。 */
-    public static MtopSender.Result claimTaskReward(final String taskId, final String pitId) {
+    /**
+     * 领取某个已完成任务的奖励。抓包实测: 请求体只有 taskId, 且必须带 wua 签名。
+     * token 失效时会自动作废缓存重试一次。
+     */
+    public static MtopSender.Result claimTaskReward(final String taskId) {
         return withToken(new TokenCall() {
             @Override
             public MtopSender.Result run(String token) {
                 try {
                     JSONObject data = new JSONObject();
-                    data.put("taskActivityId", TASK_ACTIVITY_ID);
                     data.put("taskId", taskId == null ? "" : taskId);
-                    data.put("pitId", pitId == null ? "" : pitId);
-                    return MtopSender.send(API_CLAIM_TASK, VERSION, data.toString(), false, authHeaders(token));
+                    return MtopSender.send(API_CLAIM_TASK, VERSION, data.toString(), true, authHeaders(token));
                 } catch (Throwable t) {
                     Log.err(TAG, "claimTaskReward err:", t);
                     return null;
                 }
             }
         });
+    }
+
+    /** 领奖返回里实际到手的体力(grantResult.pointNum), 解析不到返回 -1。 */
+    public static int claimedPoints(MtopSender.Result result) {
+        JSONObject grant = grantResultOf(result);
+        return grant == null ? -1 : toInt(grant.optString("pointNum"), -1);
+    }
+
+    /** 领奖返回里实际到手的卡币(grantResult.kabiNum, 部分任务没有), 解析不到返回 -1。 */
+    public static int claimedKabi(MtopSender.Result result) {
+        JSONObject grant = grantResultOf(result);
+        return grant == null ? -1 : toInt(grant.optString("kabiNum"), -1);
+    }
+
+    private static JSONObject grantResultOf(MtopSender.Result result) {
+        if (result == null || !result.ok) {
+            return null;
+        }
+        JSONObject body = result.body();
+        return body == null ? null : body.optJSONObject("grantResult");
+    }
+
+    /** 失败的返回其实是「该任务已领过」——属于可忽略的幂等结果, 不该当报错记。 */
+    public static boolean isAlreadyClaimed(MtopSender.Result result) {
+        if (result == null || result.ok) {
+            return false;
+        }
+        String s = (result.retText + " " + result.retCode + " " + result.failReason).toUpperCase(java.util.Locale.ROOT);
+        return s.contains("已领取") || s.contains("HAVE_RECEIVE") || s.contains("HAS_RECEIVE")
+                || s.contains("HASRECEIVE") || s.contains("ALREADY_RECEIVE") || s.contains("REPEAT");
     }
 
     // ═══════════════════════════ 任务中心解析 ═══════════════════════════

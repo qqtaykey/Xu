@@ -1,6 +1,15 @@
 package com.surexu.sesame.model.task.antForest;
 
+import android.content.Context;
+import android.net.ConnectivityManager;
+import android.net.NetworkCapabilities;
+import android.os.Build;
+import android.telephony.TelephonyManager;
+import android.util.DisplayMetrics;
+
 import org.json.JSONObject;
+
+import com.surexu.sesame.hook.ApplicationHook;
 
 import java.io.ByteArrayOutputStream;
 import java.io.InputStream;
@@ -20,23 +29,22 @@ public final class ReadForestRpcCall {
     private static final String DEFAULT_VERSION = "0.2.2410251510.53";
     private static final String HOST = "https://m.zhangwenwh.com/api";
     private static final Random RANDOM = new Random();
-    private static volatile String currentMiniMark = "";
 
     private ReadForestRpcCall() {
     }
 
-    public static void setMiniMark(String str) {
-        currentMiniMark = str == null ? "" : str;
-    }
-
     /* 登录: 用authCode换取token */
-    public static String login(String authCode, String miniMark, String version) throws Exception {
-        setMiniMark(miniMark);
+    public static String login(String authCode, String version) throws Exception {
         JSONObject body = new JSONObject();
         body.put("auth_code", authCode);
         body.put("app_id", APP_ID);
         body.put("cid", "7001");
         return post("/authorization", body, null, getReferer(version, null, null));
+    }
+
+    /* 校验缓存token是否仍有效: 带token请求authorization, 有效时返回data="success" */
+    public static String checkToken(String token, String version) throws Exception {
+        return post("/authorization", new JSONObject(), token, getReferer(version, null, null));
     }
 
     /* 首页书城: 获取免费书列表 */
@@ -50,7 +58,7 @@ public final class ReadForestRpcCall {
         if (chapterId == null || chapterId.length() == 0) {
             path = "/book/chapter?book_id=" + bookId;
         } else {
-            path = "/book/chapter?book_id=" + bookId + "&chapter_id=" + chapterId;
+            path = "/book/chapter?book_id=" + bookId + "&chapter_id=" + chapterId + "&chapter_num=&source=";
         }
         return get(path, token, getReferer(version, bookId, chapterId));
     }
@@ -104,16 +112,96 @@ public final class ReadForestRpcCall {
         return base + "#pages/index/index";
     }
 
+    /* 机型/系统段: 优先取本机 WebView 真实 UA, 取不到再用本机 Build 信息现场拼装(不再写死别人的机型) */
+    private static String getDeviceUaPart() {
+        String realUa = System.getProperty("http.agent");
+        if (realUa != null && realUa.length() > 0) {
+            return realUa;
+        }
+        return "Mozilla/5.0 (Linux; Android " + Build.VERSION.RELEASE + "; " + Build.MODEL + " Build/" + Build.ID + "; wv)"
+                + " AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/105.0.5195.148 Mobile Safari/537.36";
+    }
+
+    /* 支付宝版本号取本机实际值, 不再写死别人抓包的版本 */
+    private static String getLocalAlipayVersion() {
+        try {
+            String version = String.valueOf(ApplicationHook.getAlipayVersion());
+            if (version != null && version.length() > 0 && !"null".equals(version)) {
+                return version;
+            }
+        } catch (Throwable ignored) {
+        }
+        return "10.6.58.8000";
+    }
+
+    /**
+     * 动态拼装 User-Agent, 按小程序真实请求头对齐(v1.4.6 抓包确认):
+     * 机型/系统与支付宝版本仍取本机真实值, MYWeb/nt/ws 等按真实格式追加, 不再带 ChannelId。
+     */
     private static String getBaseUserAgent() {
-        return "Mozilla/5.0 (Linux; Android 11; M2006J10C Build/RP1A.200720.011; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/105.0.5195.148 MYWeb/0.11.0.241014163223 UWS/3.22.2.9999 UCBS/3.22.2.9999_220000000000 Mobile Safari/537.36 NebulaSDK/1.8.100112 Nebula AlipayDefined(nt:WIFI,ws:393|0|2.75) AliApp(AP/10.6.58.8000) AlipayClient/10.6.58.8000 Language/zh-Hans isConcaveScreen/false Region/CNAriver/1.0.0 ChannelId(" + (RANDOM.nextInt(10) + 1) + ")";
+        String alipayVersion = getLocalAlipayVersion();
+        // 真实 UA 里 Mobile Safari/537.36 位于 UCBS 之后, 本机 UA 末尾自带的那份要去掉
+        String devicePart = getDeviceUaPart().replace(" Mobile Safari/537.36", "").trim();
+        return devicePart
+                + " MYWeb/1.11.126.260911211123 UWS/3.22.2.9999 UCBS/3.22.2.9999_220000000000"
+                + " Mobile Safari/537.36 NebulaSDK/1.8.100112 Nebula"
+                + " AlipayDefined(nt:" + networkType() + ",ws:" + screenSpec() + ")"
+                + " AliApp(AP/" + alipayVersion + ") AlipayClient/" + alipayVersion
+                + " Language/zh-Hans isConcaveScreen/true Region/CNAriver/" + alipayVersion + " DTN/2.0";
+    }
+
+    /* 当前网络类型(WIFI/5G/4G), 取不到按 WIFI */
+    private static String networkType() {
+        try {
+            Context context = ApplicationHook.getContext();
+            if (context != null) {
+                ConnectivityManager cm = (ConnectivityManager) context.getSystemService(Context.CONNECTIVITY_SERVICE);
+                if (cm != null) {
+                    NetworkCapabilities caps = cm.getNetworkCapabilities(cm.getActiveNetwork());
+                    if (caps != null) {
+                        if (caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)) {
+                            return "WIFI";
+                        }
+                        if (caps.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR)) {
+                            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                                TelephonyManager tm = (TelephonyManager) context.getSystemService(Context.TELEPHONY_SERVICE);
+                                if (tm != null && tm.getDataNetworkType() == TelephonyManager.NETWORK_TYPE_NR) {
+                                    return "5G";
+                                }
+                            }
+                            return "4G";
+                        }
+                    }
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+        return "WIFI";
+    }
+
+    /* 屏幕规格(宽|0|密度), 取不到用 393|0|2.75 */
+    private static String screenSpec() {
+        try {
+            Context context = ApplicationHook.getContext();
+            if (context != null) {
+                DisplayMetrics dm = context.getResources().getDisplayMetrics();
+                int width = Math.round(dm.widthPixels / dm.density);
+                float density = Math.round(dm.density * 100) / 100f;
+                return width + "|0|" + density;
+            }
+        } catch (Throwable ignored) {
+        }
+        return "393|0|2.75";
     }
 
     private static Map<String, String> getHeaders(String token, String referer) {
         Map<String, String> headers = new LinkedHashMap<>();
-        headers.put("alipayminimark", currentMiniMark == null ? "" : currentMiniMark);
         headers.put("content-type", "application/json;charset=UTF-8");
         headers.put("referer", referer == null ? "" : referer);
         headers.put("user-agent", getBaseUserAgent());
+        headers.put("x-requested-with", "com.eg.android.AlipayGphone");
+        headers.put("x-mass-tappid", APP_ID);
+        headers.put("accept-language", "zh-CN,zh;q=0.9,en-US;q=0.8,en;q=0.7");
         headers.put("x-release-type", "ONLINE");
         if (token != null) {
             headers.put("authorization", "Bearer " + token);

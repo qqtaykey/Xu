@@ -371,7 +371,9 @@ public class Log {
     }
 
     public static void debug(String s) {
-        if (!com.surexu.sesame.data.AppConfig.INSTANCE.getEnableDebugLog()) {
+        // 走 AppConfig.isDebugLogEnabled(): 内存值优先, 为假时按 appConfig.json 时间戳惰性重读,
+        // 使「抓包记录」开关在收不到 reloadConfig 广播的注入子进程(小程序容器)也即时生效
+        if (!com.surexu.sesame.data.AppConfig.isDebugLogEnabled()) {
             return;
         }
         debugLogger.d(withUser(s));

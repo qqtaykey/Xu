@@ -760,24 +760,24 @@ public class ApplicationHook {
     }
 
     /**
-     * 抓包总开关(启动期判定): 「开启抓包(基于新接口)」或「抓包记录」任一打开即安装抓包 hook。
-     * <p>hook 只负责记录, 是否可见由日志分项开关控制; 「抓包记录」打开即写入 debug 日志。
+     * 抓包总开关(唯一判据): 「开启抓包(基于新接口)」({@code BaseModel.debugMode}) 或
+     * 「抓包记录」({@code AppConfig.enableDebugLog}) 任一打开即安装抓包 hook。
+     * <p>hook 只负责记录, 是否可见由 {@code Log.debug} 按「抓包记录」统一门控。
+     * <p>不再要求「使用新接口」为真: 抓包 hook 只读 ariver/mtopsdk/okhttp 链路, 与 rpcBridge 走新/旧
+     * 实现无关; 原来的 newRpc 前置会让关了「使用新接口」的用户整个抓包功能不可用。
+     * <p>子进程读不到按账号存的 {@code BaseModel}（未 load, 取静态默认值）, 此时以已落盘、跨进程
+     * 即时可见的 {@code AppConfig} 为准 —— 原 {@code isCaptureEnabledRuntime} 的分叉判据并入本方法,
+     * 避免启动期与运行期两套口径再次漂移。
      */
     private static boolean isCaptureEnabled() {
-        if (!BaseModel.getNewRpc().getValue()) {
-            return false;
+        try {
+            if (BaseModel.getDebugMode().getValue()) {
+                return true;
+            }
+        } catch (Throwable ignored) {
+            // 子进程未加载模型配置: 落到 AppConfig 判据
         }
-        return BaseModel.getDebugMode().getValue()
-                || Boolean.TRUE.equals(AppConfig.INSTANCE.getEnableDebugLog());
-    }
-
-    /**
-     * 运行期(收到 reloadConfig 广播后)判定: 以 AppConfig(已落盘, 跨进程即时可见)为准,
-     * 避免读到注入进程内存里尚未刷新的 BaseModel 旧值。
-     */
-    private static boolean isCaptureEnabledRuntime() {
-        return Boolean.TRUE.equals(AppConfig.INSTANCE.getEnableDebugLog())
-                || BaseModel.getDebugMode().getValue();
+        return Boolean.TRUE.equals(AppConfig.INSTANCE.getEnableDebugLog());
     }
 
     /**
@@ -804,6 +804,8 @@ public class ApplicationHook {
         installAriverRpcCaptureHooks(cl);
         installMtopDumpHooks(cl);
         installHttpCaptureHooks(cl);
+        // 小程序(游戏等)网络抓包: 与上面几项共用「抓包记录」开关, 同样只读记录
+        MiniProgramHook.install(cl, processName);
     }
 
     /**
@@ -896,6 +898,7 @@ public class ApplicationHook {
             }
             okhttpCaptureUnhook = null;
         }
+        MiniProgramHook.uninstall();
         captureHooksInstalled = false;
         lastHttpCaptureKey = "";
         mtopDumpHooksInstalled = false;
@@ -1383,9 +1386,11 @@ public class ApplicationHook {
                 AppConfig.load();
             } catch (Throwable ignore) {
             }
-            if (!isCaptureEnabledRuntime()) {
-                return;
-            }
+            // 子进程(小程序容器 :appbrand* / 沙箱等)不做开关判定, 无条件安装抓包 hook:
+            // 1) 子进程读不到按账号存的 BaseModel 开关(取静态默认值), 只能看 AppConfig;
+            // 2) 子进程收不到主进程的 reloadConfig 广播, 一旦 attach 时开关未开, 本进程永远不会补装,
+            //    表现为「开了抓包但小程序一直没记录, 必须重启小程序/支付宝」。
+            // 抓包 hook 全是只读记录, 是否写出由 Log.debug 按「抓包记录」门控, 故无条件安装是安全的。
             installAllCaptureHooks(cl);
             Log.debug(TAG + ", sub-process capture hooks installed: " + processName);
         } catch (Throwable t) {
@@ -1849,7 +1854,7 @@ public class ApplicationHook {
                             AppConfig.load();
                             // 抓包开关改动后无需重启支付宝: 立即安装/卸载抓包 hook,
                             // 否则注入进程内存里仍是旧开关, 钩子不会装上/不会生效
-                            if (isCaptureEnabledRuntime()) {
+                            if (isCaptureEnabled()) {
                                 ensureDebugLogOn();
                                 installAllCaptureHooks(classLoader);
                             } else {

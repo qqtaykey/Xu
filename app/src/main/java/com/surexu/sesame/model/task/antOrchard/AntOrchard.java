@@ -425,8 +425,15 @@ public class AntOrchard extends ModelTask {
         return Outcome.RETRY;
     }
 
-    /** 农场抽抽乐完成上报：两条腿互备（{@code finishTaskantorchard} → {@code finishTaskantorchardV2}）。 */
-    private Outcome attemptChouChouLeFinish(String taskSceneCode, String taskType, String taskName) {
+    /**
+     * 抽抽乐任务完成尝试。
+     * <p>先按任务形态把"真实行为"伪造出去（游戏类伪造游玩、浏览计时类等够时长），再走两条报完成腿；
+     * 服务端回 400000040（不支持 rpc 调用）时交回统一策略，由 {@code TaskAlternative} 用 doFarmTask 伪申报兜底。
+     */
+    private Outcome attemptChouChouLeFinish(String taskSceneCode, String taskType, String taskName,
+                                           JSONObject taskBaseInfo) {
+        // 报完成前的前置伪造：这一期服务端只认"行为已发生"，直接报完成不认
+        AntOrchardDrawTaskForge.forgeBehavior(taskBaseInfo, taskName);
         try {
             JSONObject jo = new JSONObject(AntOrchardRpcCall.finishTaskantorchard(taskType, taskSceneCode));
             if (MessageUtil.checkSuccess(TAG, jo)) {
@@ -624,15 +631,20 @@ public class AntOrchard extends ModelTask {
                         if (remain <= 0) {
                             continue;
                         }
+                        Log.i(TAG, "农场抽抽乐任务[" + taskName + "]#形态:" + AntOrchardDrawTaskForge.routeOf(taskBaseInfo));
                         for (int cnt = 0; cnt < remain; cnt++) {
                             Outcome outcome = TaskAttemptPolicy.handle(
                                     "orchard::chouchoule::" + taskSceneCode + "/" + taskType
                                             + "#" + (rightsTimes + cnt) + "@" + loopCount,
                                     taskName, null,
-                                    () -> attemptChouChouLeFinish(taskSceneCode, taskType, taskName), Log::farm,
+                                    () -> attemptChouChouLeFinish(taskSceneCode, taskType, taskName, taskBaseInfo),
+                                    Log::farm,
                                     new TaskAttemptPolicy.Site("OrchardChouChouLeTaskList", "农场抽抽乐",
-                                            taskType, taskSceneCode,
-                                            (TaskAttemptPolicy.StatusProbe) (k) -> probeOrchardChouChouLeStatus(sceneCode, taskSceneCode, taskType)));
+                                            taskType, taskSceneCode, TaskAlternative.DEFAULT_VERSION,
+                                            null,
+                                            (TaskAttemptPolicy.StatusProbe) (k) -> probeOrchardChouChouLeStatus(sceneCode, taskSceneCode, taskType),
+                                            null,
+                                            AntOrchardDrawTaskForge.isRealAction(taskBaseInfo)));
                             if (outcome == Outcome.DONE || outcome == Outcome.TRIGGERED
                                     || outcome == Outcome.AWARDED) {
                                 doublecheck = true;

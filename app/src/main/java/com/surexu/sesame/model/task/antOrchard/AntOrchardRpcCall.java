@@ -2,6 +2,8 @@ package com.surexu.sesame.model.task.antOrchard;
 
 import android.util.Base64;
 
+import org.json.JSONObject;
+
 import java.util.List;
 
 import com.surexu.sesame.hook.ApplicationHook;
@@ -13,6 +15,12 @@ import com.surexu.sesame.util.idMap.UserIdMap;
 public class AntOrchardRpcCall {
 
     private static final String VERSION = "20250812.01";
+
+    /** 抽抽乐（阿肥寻宝记）外链 chInfo：2026-10-21 双十一专场抓包，游戏类任务上报的 source/CH_INFO */
+    private static final String DRAW_CH_INFO = "bbnc_mc_xemkib05";
+
+    /** 抽抽乐游戏上报的场景标识（与农场乐园游戏任务链路一致，服务端按 nongchangleyuan 记账） */
+    private static final String DRAW_SCENE_ID = "nongchangleyuan";
 
     public static String orchardIndex() {
         return ApplicationHook.requestString("com.alipay.antfarm.orchardIndex", "[{\"inHomepage\":\"true\",\"requestType\":\"NORMAL\",\"sceneCode\":\"ORCHARD\",\"source\":\"ch_appcenter__chsub_9patch\",\"version\":\"" + VERSION + "\"}]");
@@ -223,6 +231,60 @@ public class AntOrchardRpcCall {
         return ApplicationHook.requestString("com.alipay.antiep.finishTask", "[{\"outBizNo\":\"" + outBizNo + "\",\"requestType\":\"NORMAL\",\"sceneCode\":\"" + sceneCode + "\",\"source\":\"antorchard\",\"taskType\":\"" + taskType + "\",\"userId\":\"" + userId + "\",\"version\":\"20250812.01\"}]");
     }
 
+
+    /* ==================== 抽抽乐游戏类任务：行为伪造接口（2026-10-21 双十一专场抓包） ==================== */
+
+    /**
+     * 游戏资源预热。真机进抽抽乐活动后会对每个游戏任务 appId 各发一次：
+     * {@code sceneId=AntOrchard}、{@code sceneContext.subScene=orchard_lottery}、{@code source=抽抽乐 chInfo}。
+     */
+    public static String gamepreloadConsult(String appId, String source) {
+        return ApplicationHook.requestString("com.alipay.gameflash.biz.rpc.gamepreload.consult", "[{\"appId\":\"" + appId + "\",\"deviceLevel\":\"high\",\"networkType\":\"WWAN\",\"sceneContext\":{\"subScene\":\"orchard_lottery\"},\"sceneId\":\"AntOrchard\",\"source\":\"" + source + "\",\"unityDeviceLevel\":\"high\"}]");
+    }
+
+    /**
+     * 游戏事件上报（GAME_FIRST_FRAME / loading_completed / game_play）。
+     * 属性按抽抽乐场景填（CH_INFO=抽抽乐 chInfo、SCENE_ID=nongchangleyuan、PALADINX_VERSION 与游戏链路一致）。
+     * {@code source} 传 null 时按事件类型取与农场乐园游戏链路相同的默认值。
+     */
+    public static String submitDrawGameEvent(String appId, String eventId, long elapsedTime, String source) {
+        try {
+            String eventSource = source;
+            if (eventSource == null || eventSource.isEmpty()) {
+                eventSource = "loading_completed".equals(eventId) ? "my.reportLoadingCompleted" : "my.reportGamePlay";
+            }
+            JSONObject eventAttrMap = new JSONObject();
+            eventAttrMap.put("CH_INFO", DRAW_CH_INFO);
+            eventAttrMap.put("CPS_ID", "unknown");
+            eventAttrMap.put("GAME_VERSION", "6.5.72");
+            eventAttrMap.put("PALADINX_VERSION", "2.1.95");
+            eventAttrMap.put("PLAY_SCENE", "NORMAL");
+            eventAttrMap.put("SCENE_ID", DRAW_SCENE_ID);
+            if ("GAME_FIRST_FRAME".equals(eventId)) {
+                eventAttrMap.put("ALIVE_ENTER", "0");
+            }
+            if (elapsedTime > 0) {
+                eventAttrMap.put("GAME_ELAPASED_TIME", elapsedTime);
+            }
+            JSONObject body = new JSONObject();
+            body.put("appId", appId);
+            body.put("eventAttrMap", eventAttrMap);
+            body.put("eventId", eventId);
+            body.put("idempotentNo", "platform_" + System.currentTimeMillis() + "_" + RandomUtil.getRandom(5));
+            body.put("source", eventSource);
+            return ApplicationHook.requestString("com.alipay.gameevent.biz.rpc.submitEvent", "[" + body + "]");
+        } catch (Throwable t) {
+            return "";
+        }
+    }
+
+    /**
+     * 上报游戏时长（抽抽乐游戏类任务伪游玩用）。与农场乐园链路同型：
+     * 接口 {@code com.alipay.gamecenteruprod.biz.rpc.v3.submitUserPlayDurationAction}。
+     */
+    public static String submitDrawGameDuration(String gameAppId, int playTime, String source) {
+        return ApplicationHook.requestString("com.alipay.gamecenteruprod.biz.rpc.v3.submitUserPlayDurationAction", "[{\"gameAppId\":\"" + gameAppId + "\",\"playTime\":" + playTime + ",\"source\":\"" + source + "\",\"statisticTag\":\"\"}]");
+    }
 
     /**
      * 带参数的 orchardSyncIndex（适配第二个文件中的调用）

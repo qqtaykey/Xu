@@ -2,6 +2,7 @@ package com.surexu.sesame.data;
 
 import com.fasterxml.jackson.annotation.JsonIgnore;
 import com.fasterxml.jackson.databind.JsonMappingException;
+import com.fasterxml.jackson.databind.JsonNode;
 import lombok.Data;
 import com.surexu.sesame.hook.ApplicationHook;
 import com.surexu.sesame.util.ClassUtil;
@@ -30,6 +31,9 @@ public class AppConfig {
 
     /** 进程级加载标记：LanguageUtil/ThemeUtil 每页都会触发加载，仅首次真正读盘 */
     private static final AtomicBoolean configLoadedOnce = new AtomicBoolean(false);
+
+    /** 上次成功读到的 appConfig.json lastModified：供跨进程惰性重读判断文件是否被别的进程改写 */
+    private static volatile long lastLoadedModified = 0L;
 
     /** 异步落盘专用：单线程串行，避免并发写同一文件 */
     private static final ExecutorService SAVE_EXECUTOR = Executors.newSingleThreadExecutor();
@@ -165,6 +169,71 @@ public class AppConfig {
         return INSTANCE;
     }
 
+    /**
+     * 跨进程惰性重读开关：仅当 appConfig.json 的 lastModified 与上次读取不同时, 重新解析并把
+     * 「日志/抓包」开关搬进内存; 不写盘、不做格式化回写、不改动其它配置字段。
+     *
+     * <p>存在意义：注入进程（尤其小程序容器子进程）收不到 UI 侧的 reloadConfig 广播, 内存里的开关
+     * 会一直停在启动那一刻的值, 表现为「用户在设置里开了抓包记录, 小程序却一直没记录, 必须重启小程序」。
+     * 本方法让开关改动按文件时间戳即时生效。
+     *
+     * @return 是否发生了重读且有字段变化
+     */
+    public static boolean refreshIfChanged() {
+        try {
+            File appConfigFile = new File(APP_CONFIG_DIRECTORY_FILE, "appConfig.json");
+            if (!appConfigFile.exists() || !appConfigFile.canRead()) {
+                return false;
+            }
+            long modified = appConfigFile.lastModified();
+            if (modified == 0L || modified == lastLoadedModified) {
+                return false;
+            }
+            String json = FileUtil.readFromFile(appConfigFile);
+            if (json == null || json.isEmpty()) {
+                return false;
+            }
+            // 解析成独立的树、只搬开关字段：半份/异常 JSON 不会污染内存里其它配置
+            JsonNode node = JsonUtil.copyMapper().readTree(json);
+            lastLoadedModified = modified;
+            if (node == null) {
+                return false;
+            }
+            boolean changed = false;
+            JsonNode debugLogNode = node.get("enableDebugLog");
+            if (debugLogNode != null && debugLogNode.isBoolean()) {
+                Boolean value = debugLogNode.asBoolean();
+                if (!value.equals(INSTANCE.getEnableDebugLog())) {
+                    INSTANCE.setEnableDebugLog(value);
+                    changed = true;
+                }
+            }
+            JsonNode newRpcNode = node.get("newRpc");
+            if (newRpcNode != null && newRpcNode.isBoolean()) {
+                Boolean value = newRpcNode.asBoolean();
+                if (!value.equals(INSTANCE.getNewRpc())) {
+                    INSTANCE.setNewRpc(value);
+                    changed = true;
+                }
+            }
+            return changed;
+        } catch (Throwable t) {
+            // 读/解析失败保持内存现值；本方法在日志热路径上被调用, 不能抛异常、不能写日志(会递归)
+            return false;
+        }
+    }
+
+    /**
+     * 「抓包记录」是否写出（抓包 hook 与运行日志共用）：内存值优先; 为假时按文件时间戳惰性
+     * 重读一次, 保证跨进程（尤其收不到广播的注入子进程）即时生效。
+     */
+    public static boolean isDebugLogEnabled() {
+        if (Boolean.TRUE.equals(INSTANCE.getEnableDebugLog())) {
+            return true;
+        }
+        return refreshIfChanged() && Boolean.TRUE.equals(INSTANCE.getEnableDebugLog());
+    }
+
     /** 异步落盘：调用线程（主线程）只做快照序列化，文件 IO 交给后台单线程执行；
      *  与 save() 同款 loadFailed 保护，失败时不写盘。 */
     public static void saveAsync() {
@@ -183,6 +252,7 @@ public class AppConfig {
             if (appConfigFile.exists()) {
                 String json = FileUtil.readFromFile(appConfigFile);
                 JsonUtil.copyMapper().readerForUpdating(INSTANCE).readValue(json);
+                lastLoadedModified = appConfigFile.lastModified();
                 // 注意：必须先加载文件再打印日志，否则开关判断仍取默认值 true，
                 // 导致「运行日志已关闭」时启动进程仍写入加载日志
                 // 仅主进程记录：子进程(tools/push/gpu/sandboxed_privilege/syntax)注入也会调用 load(),
